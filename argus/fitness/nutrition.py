@@ -2,6 +2,10 @@
 
 Pure functions over Store rows (dicts from ``foods_*`` / ``weights_between`` / ``workouts_between``);
 no I/O. All numbers the model reports come from here, never from the model's own arithmetic.
+
+Rows imported from the Markdown logs with unknown totals (kcal stored as 0) or unknown protein are
+"no data" for those numbers: they never raise ``under_min_kcal`` / ``protein_low``, and a day holding
+only such rows does not count as a logged day in ``period_summary``.
 """
 
 from __future__ import annotations
@@ -13,6 +17,8 @@ from datetime import date, timedelta
 from typing import Literal
 
 from argus.config import WEEKDAYS, FitnessConfig
+from argus.fitness.importer import PROTEIN_UNKNOWN, TOTALS_UNKNOWN
+from argus.store import IMPORTED_PREFIX
 
 _RANGES = ("protein_g", "fat_g", "carbs_g")
 _SODIUM = ("low", "medium", "high")
@@ -27,6 +33,24 @@ class DayStatus:
     budget: dict
     remaining: dict
     flags: list[str]
+
+
+def _import_remarks(f: dict) -> list[str]:
+    note = f.get("note") or ""
+    if not note.startswith(IMPORTED_PREFIX):
+        return []
+    return [r.strip() for r in note[len(IMPORTED_PREFIX):].split(";")]
+
+
+def totals_unknown(f: dict) -> bool:
+    """True for an imported row whose day totals were not recorded (its kcal/protein 0 means "no data")."""
+    return TOTALS_UNKNOWN in _import_remarks(f)
+
+
+def protein_unknown(f: dict) -> bool:
+    """True for an imported row whose protein was not recorded (or whose totals were not)."""
+    remarks = _import_remarks(f)
+    return TOTALS_UNKNOWN in remarks or PROTEIN_UNKNOWN in remarks
 
 
 def is_training_day(day: date, workouts_that_day: list[dict], cfg: FitnessConfig) -> bool:
@@ -59,10 +83,12 @@ def day_status(day: date, foods: list[dict], workouts_that_day: list[dict], cfg:
         remaining[key] = (lo - totals[key], hi - totals[key])
     remaining["added_sugar_g"] = budget["added_sugar_g_max"] - totals["added_sugar_g"]
 
+    kcal_unknown = any(totals_unknown(f) for f in foods)
+    prot_unknown = any(protein_unknown(f) for f in foods)
     flags: list[str] = []
     if totals["kcal"] > budget["kcal"]:
         flags.append("over_kcal")
-    if totals["kcal"] < budget["min_kcal"]:
+    if totals["kcal"] < budget["min_kcal"] and not kcal_unknown:
         flags.append("under_min_kcal")
     if totals["fat_g"] > budget["fat_g"][1]:
         flags.append("over_fat")
@@ -70,10 +96,14 @@ def day_status(day: date, foods: list[dict], workouts_that_day: list[dict], cfg:
         flags.append("over_carbs")
     if totals["added_sugar_g"] > budget["added_sugar_g_max"]:
         flags.append("over_sugar")
-    if totals["protein_g"] < budget["protein_g"][0]:
+    if totals["protein_g"] < budget["protein_g"][0] and not prot_unknown:
         flags.append("protein_low")
     if totals["sodium"]["high"]:
         flags.append("sodium_high")
+    if kcal_unknown:
+        flags.append("totals_unknown")
+    elif prot_unknown:
+        flags.append("protein_unknown")
     return DayStatus(
         day=day,
         day_type="training" if training else "rest",
@@ -166,6 +196,9 @@ def period_summary(
         if not day_foods:
             lines.append(f"{head} no entries")
             continue
+        if all(totals_unknown(f) for f in day_foods):
+            lines.append(f"{head} no data (imported, totals unknown)")
+            continue
         logged.append(s)
         t, b = s.totals, s.budget
         parts = ", ".join(
@@ -176,11 +209,15 @@ def period_summary(
 
     if logged:
         avg_kcal = sum(s.totals["kcal"] for s in logged) / len(logged)
-        avg_protein = sum(s.totals["protein_g"] for s in logged) / len(logged)
+        with_protein = [s for s in logged if not any(protein_unknown(f) for f in s.entries)]
+        avg_protein = (
+            f"{_r(sum(s.totals['protein_g'] for s in with_protein) / len(with_protein))} g"
+            if with_protein else "unknown"
+        )
         over = sum("over_kcal" in s.flags for s in logged)
         low = sum("protein_low" in s.flags for s in logged)
         lines.append(
-            f"Logged days: {len(logged)}/{len(days)}, avg {_r(avg_kcal)} kcal, avg protein {_r(avg_protein)} g; "
+            f"Logged days: {len(logged)}/{len(days)}, avg {_r(avg_kcal)} kcal, avg protein {avg_protein}; "
             f"over kcal {over} day(s), protein low {low} day(s)"
         )
     else:

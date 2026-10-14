@@ -4,7 +4,12 @@
 becomes ONE ``food_log`` entry (``meal="other"``) holding the day's recorded totals. ``weight-log.md``
 has ``| 日期 | 体重（公斤） | 腰围（厘米） | 备注 |``. Imported rows carry the ``[imported]`` note prefix;
 a day that already has an imported row (even a deleted one) is skipped, so re-running is safe.
-Numbers are never invented: missing totals are stored as 0 with a note saying so.
+
+The files are a one-time history source: once Argus has a chat-logged (non-imported) entry, only rows
+dated strictly before the earliest such entry are imported, so later hand edits to the files never
+double-count days Argus already tracks. Food and weight are cut off independently.
+Numbers are never invented: missing totals are stored as 0 with the ``TOTALS_UNKNOWN`` note marker,
+which ``nutrition`` treats as "no data".
 """
 
 from __future__ import annotations
@@ -25,21 +30,26 @@ _NUMBER = re.compile(r"\d+(?:\.\d+)?")
 # A complete value: optional "约", a number, an optional unit.
 _FULL_VALUE = re.compile(r"约?\s*(\d+(?:\.\d+)?)\s*(?:千卡|大卡|kcal|克|g)?", re.IGNORECASE)
 _IMPORTED_AT = time(12, 0)
+# Note markers that ``argus.fitness.nutrition`` recognises on imported rows.
+TOTALS_UNKNOWN = "totals unknown"
+PROTEIN_UNKNOWN = "protein unknown"
 
 
 def import_markdown_logs(store: Store, fitness_dir: Path) -> dict:
     """Import ``food-log.md`` and ``weight-log.md`` from ``fitness_dir``; missing files are skipped.
 
-    Returns counts: ``food_imported``, ``food_skipped`` (day already imported), ``weight_imported``,
-    ``weight_skipped``, and ``invalid`` (rows the Store rejected, e.g. absurd values; never raised).
+    Returns counts: ``food_imported``, ``food_skipped`` (day already imported, or on/after the first
+    chat-logged entry), ``weight_imported``, ``weight_skipped``, and ``invalid`` (rows the Store
+    rejected, e.g. absurd values; never raised).
     """
     result = {"food_imported": 0, "food_skipped": 0, "weight_imported": 0, "weight_skipped": 0, "invalid": 0}
     food_path = fitness_dir / FOOD_FILE
     if food_path.is_file():
         done = store.imported_days("food")
+        cutoff = _first_logged_day(store.foods_between(date.min, date.max))
         for row in _table_rows(food_path.read_text(encoding="utf-8"), _FOOD_HEADER):
             day = date.fromisoformat(row["日期"])
-            if day in done:
+            if day in done or (cutoff is not None and day >= cutoff):
                 result["food_skipped"] += 1
                 continue
             try:
@@ -52,12 +62,13 @@ def import_markdown_logs(store: Store, fitness_dir: Path) -> dict:
     weight_path = fitness_dir / WEIGHT_FILE
     if weight_path.is_file():
         done = store.imported_days("weight")
+        cutoff = _first_logged_day(store.weights_between(date.min, date.max))
         for row in _table_rows(weight_path.read_text(encoding="utf-8"), _WEIGHT_HEADER):
             day = date.fromisoformat(row["日期"])
             weight = _parse_value(row["体重（公斤）"])
             if weight is None:
                 continue  # nothing recorded that day
-            if day in done:
+            if day in done or (cutoff is not None and day >= cutoff):
                 result["weight_skipped"] += 1
                 continue
             waist = _parse_value(row["腰围（厘米）"])
@@ -77,6 +88,12 @@ def import_markdown_logs(store: Store, fitness_dir: Path) -> dict:
     return result
 
 
+def _first_logged_day(rows: list[dict]) -> date | None:
+    """Earliest day among rows that were not imported from the Markdown files, or ``None``."""
+    days = [r["day"] for r in rows if not (r.get("note") or "").startswith(IMPORTED_PREFIX)]
+    return date.fromisoformat(min(days)) if days else None
+
+
 def _import_food(store: Store, day: date, row: dict[str, str]) -> None:
     parts = [p for p in (row["早餐"], row["晚餐"]) if p]
     description = " / ".join(parts) or "(no description)"
@@ -84,11 +101,11 @@ def _import_food(store: Store, day: date, row: dict[str, str]) -> None:
     protein = _parse_value(row["蛋白质"])
     remarks: list[str] = []
     if kcal is None:
-        remarks.append("totals unknown")
+        remarks.append(TOTALS_UNKNOWN)
     elif not kcal[1] or (protein is not None and not protein[1]):
         remarks.append("partial day")
     if kcal is not None and protein is None:
-        remarks.append("protein unknown")
+        remarks.append(PROTEIN_UNKNOWN)
     if row["训练"]:
         remarks.append(f"训练: {row['训练']}")
     if row["备注"]:

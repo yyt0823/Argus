@@ -10,10 +10,11 @@ CFG = FitnessConfig(training_days=("mon", "wed", "fri"), training_kcal=1800, res
                     protein_g=(160, 170), carbs_g=(100, 150), fat_g=(40, 50), added_sugar_g_max=25)
 MON, TUE = date(2026, 10, 12), date(2026, 10, 13)  # 2026-10-12 is a Monday
 
-def food(day=TUE, kcal=0, p=0, f=0, c=0, sugar=None, sodium=None, desc="x", meal=None, at="12:00:00", id=1):
+def food(day=TUE, kcal=0, p=0, f=0, c=0, sugar=None, sodium=None, desc="x", meal=None, at="12:00:00", id=1,
+         note=None):
     return {"id": id, "day": day.isoformat(), "logged_at": f"{day.isoformat()}T{at}", "meal": meal,
             "description": desc, "kcal": kcal, "protein_g": p, "fat_g": f, "carbs_g": c,
-            "added_sugar_g": sugar, "sodium": sodium, "note": None, "deleted": 0}
+            "added_sugar_g": sugar, "sodium": sodium, "note": note, "deleted": 0}
 
 def workout(day, kind="A"):
     return {"id": 1, "day": day.isoformat(), "logged_at": f"{day.isoformat()}T18:00:00", "kind": kind,
@@ -178,3 +179,35 @@ def test_period_summary_weight_without_previous():
 def test_period_summary_previous_only():
     text = period_summary(TUE, TUE, [], [], [weight(MON, 70.0)], [], CFG)
     assert "Weight: no entries this period (previous: avg 70.0 kg, 1 entry)" in text
+
+# --- imported rows with unknown totals ---
+
+UNKNOWN = "[imported] totals unknown; 训练: 无"
+
+def test_unknown_totals_day_raises_no_low_flags():
+    s = day_status(TUE, [food(note=UNKNOWN, meal="other")], [], CFG)
+    assert "under_min_kcal" not in s.flags and "protein_low" not in s.flags
+    assert s.flags == ["totals_unknown"]
+
+def test_protein_unknown_suppresses_only_protein_low():
+    s = day_status(TUE, [food(kcal=1000, note="[imported] protein unknown", meal="other")], [], CFG)
+    assert s.flags == ["under_min_kcal", "protein_unknown"]
+
+def test_marker_only_counts_on_imported_rows():
+    s = day_status(TUE, [food(kcal=1000, p=100, note="totals unknown")], [], CFG)
+    assert s.flags == ["under_min_kcal", "protein_low"]
+
+def test_period_summary_unknown_totals_day_is_not_logged():
+    start, end = MON, TUE
+    foods = [food(MON, kcal=1700, p=165, f=45, c=120, id=1), food(TUE, note=UNKNOWN, meal="other", id=2)]
+    text = period_summary(start, end, foods, [], [], [], CFG)
+    assert "2026-10-13 Tue rest: no data (imported, totals unknown)" in text
+    assert "Logged days: 1/2, avg 1700 kcal, avg protein 165 g; over kcal 0 day(s), protein low 0 day(s)" in text
+
+def test_period_summary_avg_protein_skips_protein_unknown_days():
+    foods = [food(MON, kcal=1700, p=165, f=45, c=120, id=1),
+             food(TUE, kcal=1500, note="[imported] protein unknown", meal="other", id=2)]
+    text = period_summary(MON, TUE, foods, [], [], [], CFG)
+    assert "Logged days: 2/2, avg 1600 kcal, avg protein 165 g; over kcal 0 day(s), protein low 0 day(s)" in text
+    only = period_summary(TUE, TUE, [foods[1]], [], [], [], CFG)
+    assert "avg protein unknown;" in only

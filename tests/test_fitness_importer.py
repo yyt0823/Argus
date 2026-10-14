@@ -108,11 +108,44 @@ def test_new_rows_imported_later(store, fdir):
     result = import_markdown_logs(store, fdir)
     assert result["food_imported"] == 1 and _foods(store)["2026-01-09"]["kcal"] == 1400
 
-def test_manual_entries_do_not_block_import(store, fdir):
+def test_chat_entries_cut_off_food_import(store, fdir):
     from datetime import datetime
-    store.add_food(date(2026, 1, 5), datetime(2026, 1, 5, 9), "manual", 100, 1, 1, 1)
+    store.add_food(date(2026, 1, 7), datetime(2026, 1, 7, 9), "chat meal", 100, 1, 1, 1)
+    result = import_markdown_logs(store, fdir)
+    assert result["food_imported"] == 2 and result["food_skipped"] == 2
+    assert sorted(_foods(store)) == ["2026-01-05", "2026-01-06", "2026-01-07"]
+    assert [r["description"] for r in store.foods_for_day(date(2026, 1, 7))] == ["chat meal"]
+
+def test_hand_edits_after_chat_logging_are_not_imported(store, fdir):
+    from datetime import datetime
     import_markdown_logs(store, fdir)
-    assert len(store.foods_for_day(date(2026, 1, 5))) == 2
+    store.add_food(date(2026, 1, 9), datetime(2026, 1, 9, 9), "chat meal", 500, 30, 10, 50)
+    (fdir / "food-log.md").write_text(FOOD_MD + "| 2026-01-09 | B | 粥 | 饺子 | 约 1400 | 约 80 | |\n"
+                                      "| 2026-01-10 | B | 粥 | 饺子 | 约 1400 | 约 80 | |\n", encoding="utf-8")
+    result = import_markdown_logs(store, fdir)
+    assert result["food_imported"] == 0
+    assert [r["description"] for r in store.foods_for_day(date(2026, 1, 9))] == ["chat meal"]
+    assert store.foods_for_day(date(2026, 1, 10)) == []
+
+def test_only_imported_rows_do_not_set_cutoff(store, fdir):
+    import_markdown_logs(store, fdir)
+    store.delete_food(_foods(store)["2026-01-05"]["id"])
+    (fdir / "food-log.md").write_text(FOOD_MD + "| 2026-01-09 | B | 粥 | 饺子 | 约 1400 | 约 80 | |\n", encoding="utf-8")
+    assert import_markdown_logs(store, fdir)["food_imported"] == 1
+
+def test_chat_entries_cut_off_weight_import(store, fdir):
+    from datetime import datetime
+    store.add_weight(date(2026, 1, 7), datetime(2026, 1, 7, 7), 79.0)
+    result = import_markdown_logs(store, fdir)
+    assert result["weight_imported"] == 1 and result["weight_skipped"] == 1
+    rows = store.weights_between(date(2026, 1, 1), date(2026, 12, 31))
+    assert [(r["day"], r["weight_kg"]) for r in rows] == [("2026-01-05", 80.0), ("2026-01-07", 79.0)]
+
+def test_food_and_weight_cutoffs_are_independent(store, fdir):
+    from datetime import datetime
+    store.add_weight(date(2026, 1, 1), datetime(2026, 1, 1, 7), 81.0)
+    result = import_markdown_logs(store, fdir)
+    assert result["weight_imported"] == 0 and result["food_imported"] == 4
 
 def test_missing_files_are_fine(store, tmp_path):
     assert import_markdown_logs(store, tmp_path / "nope") == {
