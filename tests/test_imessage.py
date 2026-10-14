@@ -100,3 +100,84 @@ def test_send_timeout_counts_as_failure(fake_chat_db, store):
     def runner(args): raise subprocess.TimeoutExpired(args, 30)
     with pytest.raises(SendError):
         chan(fake_chat_db, store, runner).send("x")
+
+# --- pending queue / restart / loop guard / circuit breaker ---
+
+class Clock:
+    def __init__(self): self.t = 1000.0
+    def __call__(self): return self.t
+
+def ok_runner(args):
+    return subprocess.CompletedProcess(args, 0, "", "")
+
+def test_poll_writes_pending_and_checkpoint(fake_chat_db, store):
+    c = chan(fake_chat_db, store); c.poll()
+    g = fake_chat_db.add("remember me", 0, T0)
+    msgs = c.poll()
+    assert store.list_pending() == msgs and msgs[0].id == g
+    assert store.get_state("imessage_last_rowid") == str(fake_chat_db.n)
+
+def test_poll_moves_checkpoint_when_everything_filtered(fake_chat_db, store):
+    c = chan(fake_chat_db, store); c.poll()
+    fake_chat_db.add("🤖 bot", 0, T0)
+    assert c.poll() == []
+    assert store.get_state("imessage_last_rowid") == str(fake_chat_db.n) and store.list_pending() == []
+
+def test_restart_between_sent_and_echo_rows_no_duplicate(fake_chat_db, store):
+    c = chan(fake_chat_db, store); c.poll()
+    fake_chat_db.add("hello", 1, T0, as_blob=True)
+    assert [m.text for m in c.poll()] == ["hello"]
+    c2 = chan(fake_chat_db, store)  # simulated restart
+    fake_chat_db.add("hello", 0, T0)
+    assert c2.poll() == []
+
+def test_restart_rebuild_keeps_already_paired_rows_paired(fake_chat_db, store):
+    c = chan(fake_chat_db, store); c.poll()
+    fake_chat_db.add("ok", 1, T0, as_blob=True)
+    fake_chat_db.add("ok", 0, T0)
+    assert [m.text for m in c.poll()] == ["ok"]
+    c2 = chan(fake_chat_db, store)
+    fake_chat_db.add("ok", 1, T0 + timedelta(seconds=3), as_blob=True)  # genuinely new message
+    assert [m.text for m in c2.poll()] == ["ok"]
+
+def test_restart_rebuild_ignores_old_rows(fake_chat_db, store):
+    c = chan(fake_chat_db, store); c.poll()
+    fake_chat_db.add("hello", 1, T0 - timedelta(seconds=120), as_blob=True)
+    fake_chat_db.add("other", 1, T0, as_blob=True)
+    c.poll()
+    c2 = chan(fake_chat_db, store)
+    fake_chat_db.add("hello", 0, T0)
+    assert [m.text for m in c2.poll()] == ["hello"]
+
+@pytest.mark.parametrize("echo", [PREFIX + "loop?", "loop?", "🤖loop?"], ids=["full", "stripped", "nospace"])
+def test_recent_sent_text_echo_dropped(fake_chat_db, store, echo):
+    c = chan(fake_chat_db, store, ok_runner); c.poll()
+    c.send("loop?")
+    fake_chat_db.add(echo, 0, T0)
+    assert c.poll() == []
+
+def test_recent_sent_text_expires(fake_chat_db, store):
+    clock = Clock()
+    c = IMessageChannel(fake_chat_db.path, ["+15550000000"], store, runner=ok_runner,
+                        sleep=lambda s: None, clock=clock)
+    c.poll()
+    c.send("loop?")
+    clock.t += 61
+    fake_chat_db.add("loop?", 0, T0)
+    assert [m.text for m in c.poll()] == ["loop?"]
+
+def test_circuit_breaker(fake_chat_db, store):
+    clock = Clock()
+    calls = []
+    def runner(args):
+        calls.append(args); return subprocess.CompletedProcess(args, 0, "", "")
+    c = IMessageChannel(fake_chat_db.path, ["+15550000000"], store, runner=runner,
+                        sleep=lambda s: None, clock=clock)
+    for _ in range(20):
+        c.send("x")
+    with pytest.raises(SendError, match="rate limit"):
+        c.send("x")
+    assert len(calls) == 20
+    clock.t += 61
+    c.send("x")
+    assert len(calls) == 21

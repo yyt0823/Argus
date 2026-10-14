@@ -11,6 +11,8 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Literal
 
+from argus.channel.base import IncomingMessage
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS messages (
     id INTEGER PRIMARY KEY,
@@ -34,6 +36,7 @@ CREATE TABLE IF NOT EXISTS sessions (
 );
 CREATE TABLE IF NOT EXISTS sent_ids (guid TEXT PRIMARY KEY, sent_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS state (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS pending (guid TEXT PRIMARY KEY, text TEXT NOT NULL, at TEXT NOT NULL);
 """
 
 # The trigram tokenizer cannot match terms shorter than 3 characters.
@@ -166,3 +169,30 @@ class Store:
             "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             (key, value),
         )
+
+    # --- pending queue (accepted incoming messages not yet fully handled) ---
+
+    def accept_messages(
+        self, messages: list[IncomingMessage], checkpoint_key: str, checkpoint_value: str
+    ) -> None:
+        """Atomically queue ``messages`` and advance the channel checkpoint."""
+        with self._lock, self._conn:
+            self._conn.executemany(
+                "INSERT OR IGNORE INTO pending (guid, text, at) VALUES (?, ?, ?)",
+                [(m.id, m.text, _ts(m.received_at)) for m in messages],
+            )
+            self._conn.execute(
+                "INSERT INTO state (key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (checkpoint_key, checkpoint_value),
+            )
+
+    def list_pending(self) -> list[IncomingMessage]:
+        rows = self._read("SELECT guid, text, at FROM pending ORDER BY at, rowid")
+        return [
+            IncomingMessage(id=r["guid"], text=r["text"], received_at=datetime.fromisoformat(r["at"]))
+            for r in rows
+        ]
+
+    def delete_pending(self, guid: str) -> None:
+        self._write("DELETE FROM pending WHERE guid = ?", (guid,))

@@ -59,3 +59,50 @@ def test_reopen_keeps_data(tmp_path):
     p = tmp_path / "x.db"
     s = Store(p); s.add_message("user", "hello world", datetime(2026, 10, 1)); s.close()
     s2 = Store(p); assert len(s2.search_messages("hello")) == 1; s2.close()
+
+# --- pending queue ---
+
+from argus.channel.base import IncomingMessage
+
+def _m(guid, text, at):
+    return IncomingMessage(id=guid, text=text, received_at=at)
+
+def test_accept_messages_writes_pending_and_checkpoint(store):
+    store.accept_messages([_m("g1", "hi", datetime(2026, 10, 1, 9, 0, 0, 500))], "cp", "42")
+    assert store.get_state("cp") == "42"
+    assert store.list_pending() == [_m("g1", "hi", datetime(2026, 10, 1, 9, 0, 0))]
+
+def test_accept_messages_empty_still_moves_checkpoint(store):
+    store.accept_messages([], "cp", "7")
+    assert store.get_state("cp") == "7" and store.list_pending() == []
+
+def test_accept_messages_is_one_transaction(store):
+    store.set_state("cp", "1")
+    bad = _m("g2", object(), datetime(2026, 10, 1))  # unbindable -> fails after g1 is inserted
+    with pytest.raises(Exception):
+        store.accept_messages([_m("g1", "ok", datetime(2026, 10, 1)), bad], "cp", "9")
+    assert store.get_state("cp") == "1" and store.list_pending() == []
+
+def test_accept_messages_ignores_duplicates(store):
+    store.accept_messages([_m("g1", "a", datetime(2026, 10, 1))], "cp", "1")
+    store.accept_messages([_m("g1", "changed", datetime(2026, 10, 2))], "cp", "2")
+    assert [m.text for m in store.list_pending()] == ["a"]
+
+def test_list_pending_ordered_by_at_then_rowid(store):
+    store.accept_messages([
+        _m("late", "c", datetime(2026, 10, 1, 10)),
+        _m("e1", "a", datetime(2026, 10, 1, 9)),
+        _m("e2", "b", datetime(2026, 10, 1, 9)),
+    ], "cp", "1")
+    assert [m.id for m in store.list_pending()] == ["e1", "e2", "late"]
+
+def test_delete_pending(store):
+    store.accept_messages([_m("g1", "a", datetime(2026, 10, 1)), _m("g2", "b", datetime(2026, 10, 1))], "cp", "1")
+    store.delete_pending("g1")
+    store.delete_pending("missing")  # no-op
+    assert [m.id for m in store.list_pending()] == ["g2"]
+
+def test_pending_survives_reopen(tmp_path):
+    p = tmp_path / "x.db"
+    s = Store(p); s.accept_messages([_m("g1", "a", datetime(2026, 10, 1))], "cp", "1"); s.close()
+    s2 = Store(p); assert [m.id for m in s2.list_pending()] == ["g1"]; s2.close()
