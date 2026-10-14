@@ -36,3 +36,14 @@ def test_bad_sql(db):
 def test_missing_db(tmp_path):
     with pytest.raises(QueryError):
         query_readonly(tmp_path / "nope.db", "SELECT 1")
+
+def test_runaway_query_times_out(db):
+    import time
+    sql = "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c) SELECT count(*) FROM c"
+    t0 = time.monotonic()
+    with pytest.raises(QueryError, match="timed out"):
+        query_readonly(db, sql, timeout_seconds=0.2)
+    assert time.monotonic() - t0 < 1.0
+
+def test_fast_query_unaffected_by_timeout(db):
+    assert query_readonly(db, "SELECT count(*) FROM t", timeout_seconds=0.2)["rows"] == [[5]]

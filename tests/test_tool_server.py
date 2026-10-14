@@ -55,3 +55,28 @@ async def test_search_history(env):
     assert text(r2) == "No matching messages."
     bad = await t["search_history"].handler({"query": "x", "start": "yesterday"})
     assert bad.get("is_error") is True
+
+async def test_query_data_does_not_block_event_loop(env):
+    import asyncio, time
+    _, _, t = env
+    # Calibrate a bounded CPU-heavy query to take roughly 0.5 s.
+    sql_n = "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c WHERE x < {n}) SELECT count(*) FROM c"
+    n = 200_000
+    t0 = time.monotonic()
+    await t["query_data"].handler({"sql": sql_n.format(n=n)})
+    dt = max(time.monotonic() - t0, 1e-3)
+    n = int(n * 0.5 / dt)
+    ticks = 0
+    async def ticker():
+        nonlocal ticks
+        while True:
+            await asyncio.sleep(0.05)
+            ticks += 1
+    task = asyncio.create_task(ticker())
+    t0 = time.monotonic()
+    r = await t["query_data"].handler({"sql": sql_n.format(n=n)})
+    elapsed = time.monotonic() - t0
+    task.cancel()
+    assert r.get("is_error") is not True, r
+    assert elapsed > 0.3
+    assert ticks >= 3

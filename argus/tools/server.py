@@ -6,9 +6,11 @@ the model can act on.
 
 from __future__ import annotations
 
+import asyncio
 import functools
 import json
 import logging
+import threading
 from datetime import date
 from pathlib import Path
 from typing import Any, Awaitable, Callable
@@ -106,7 +108,18 @@ _NAME_DOC = "Memory name: lowercase letters, digits and '-', e.g. 'knee-injury' 
 
 
 def build_tools(store: Store, memory: MemoryStore, db_path: Path) -> list[SdkMcpTool]:
-    """Create the Argus tools bound to ``store``, ``memory``, and the database at ``db_path``."""
+    """Create the Argus tools bound to ``store``, ``memory``, and the database at ``db_path``.
+
+    Handlers run all SQLite and filesystem work in a worker thread
+    (``asyncio.to_thread``) so a slow query or disk never stalls the event loop.
+    """
+    # MemoryStore's index update is read-modify-write; serialize mutations now
+    # that they run on worker threads.
+    memory_lock = threading.Lock()
+
+    def _locked(fn: Callable[..., Any], *a: Any) -> Any:
+        with memory_lock:
+            return fn(*a)
 
     @tool(
         "memory_list",
@@ -118,7 +131,7 @@ def build_tools(store: Store, memory: MemoryStore, db_path: Path) -> list[SdkMcp
     )
     @_safe
     async def memory_list(args: dict[str, Any]) -> dict[str, Any]:
-        index = memory.index().strip()
+        index = (await asyncio.to_thread(memory.index)).strip()
         return _ok(index or "(no memories)")
 
     @tool(
@@ -133,7 +146,7 @@ def build_tools(store: Store, memory: MemoryStore, db_path: Path) -> list[SdkMcp
     )
     @_safe
     async def memory_read(args: dict[str, Any]) -> dict[str, Any]:
-        return _ok(memory.read(_str_arg(args, "name")))
+        return _ok(await asyncio.to_thread(memory.read, _str_arg(args, "name")))
 
     @tool(
         "memory_write",
@@ -154,7 +167,8 @@ def build_tools(store: Store, memory: MemoryStore, db_path: Path) -> list[SdkMcp
     @_safe
     async def memory_write(args: dict[str, Any]) -> dict[str, Any]:
         name = _str_arg(args, "name")
-        memory.write(name, _str_arg(args, "content"), _str_arg(args, "summary"))
+        content, summary = _str_arg(args, "content"), _str_arg(args, "summary")
+        await asyncio.to_thread(_locked, memory.write, name, content, summary)
         return _ok(f"saved {name}")
 
     @tool(
@@ -170,7 +184,7 @@ def build_tools(store: Store, memory: MemoryStore, db_path: Path) -> list[SdkMcp
     @_safe
     async def memory_delete(args: dict[str, Any]) -> dict[str, Any]:
         name = _str_arg(args, "name")
-        memory.delete(name)
+        await asyncio.to_thread(_locked, memory.delete, name)
         return _ok(f"deleted {name}")
 
     @tool(
@@ -192,7 +206,7 @@ def build_tools(store: Store, memory: MemoryStore, db_path: Path) -> list[SdkMcp
     )
     @_safe
     async def query_data(args: dict[str, Any]) -> dict[str, Any]:
-        result = query_readonly(db_path, _str_arg(args, "sql"))
+        result = await asyncio.to_thread(query_readonly, db_path, _str_arg(args, "sql"))
         return _ok(json.dumps(result, ensure_ascii=False, default=str))
 
     @tool(
@@ -222,7 +236,8 @@ def build_tools(store: Store, memory: MemoryStore, db_path: Path) -> list[SdkMcp
         query = _str_arg(args, "query")
         start = _date_arg(args, "start")
         end = _date_arg(args, "end")
-        rows = store.search_messages(query, start=start, end=end, limit=_limit_arg(args))
+        limit = _limit_arg(args)
+        rows = await asyncio.to_thread(store.search_messages, query, start, end, limit)
         return _ok(format_history(rows))
 
     return [memory_list, memory_read, memory_write, memory_delete, query_data, search_history]
