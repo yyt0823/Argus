@@ -1,0 +1,238 @@
+"""The in-process SDK MCP server that exposes memory, data, and history tools to the model.
+
+Handlers never raise: every failure becomes an ``is_error`` result with a short message
+the model can act on.
+"""
+
+from __future__ import annotations
+
+import functools
+import json
+import logging
+from datetime import date
+from pathlib import Path
+from typing import Any, Awaitable, Callable
+
+from claude_agent_sdk import (
+    McpSdkServerConfig,
+    SdkMcpTool,
+    ToolAnnotations,
+    create_sdk_mcp_server,
+    tool,
+)
+
+from argus.store import Store
+from argus.tools.data import QueryError, query_readonly
+from argus.tools.history import format_history
+from argus.tools.memory import MemoryStore
+
+log = logging.getLogger(__name__)
+
+SERVER_NAME = "argus"
+
+_DEFAULT_LIMIT = 20
+_MAX_LIMIT = 100
+
+_READ_ONLY = ToolAnnotations(readOnlyHint=True)
+
+Handler = Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]
+
+
+class _ToolError(Exception):
+    """An expected failure whose message is shown to the model as-is."""
+
+
+def _ok(text: str) -> dict[str, Any]:
+    return {"content": [{"type": "text", "text": text}]}
+
+
+def _err(text: str) -> dict[str, Any]:
+    return {"content": [{"type": "text", "text": text}], "is_error": True}
+
+
+def _safe(handler: Handler) -> Handler:
+    """Turn any exception from ``handler`` into an ``is_error`` result."""
+
+    @functools.wraps(handler)
+    async def wrapper(args: dict[str, Any]) -> dict[str, Any]:
+        try:
+            return await handler(args or {})
+        except _ToolError as e:
+            return _err(str(e))
+        except (ValueError, QueryError) as e:
+            return _err(f"Error: {e}")
+        except FileNotFoundError:
+            return _err(f"Error: no memory named {args.get('name')!r}")
+        except KeyError as e:
+            return _err(f"Error: missing argument {e}")
+        except Exception as e:  # noqa: BLE001 - tools must never raise
+            log.exception("tool %s failed", handler.__name__)
+            return _err(f"Error: {type(e).__name__}: {e}")
+
+    return wrapper
+
+
+def _str_arg(args: dict[str, Any], key: str) -> str:
+    value = args.get(key)
+    if not isinstance(value, str):
+        raise _ToolError(f"Error: '{key}' must be a string")
+    return value
+
+
+def _date_arg(args: dict[str, Any], key: str) -> date | None:
+    value = args.get(key)
+    if value is None or value == "":
+        return None
+    try:
+        return date.fromisoformat(str(value))
+    except ValueError:
+        raise _ToolError(f"Error: '{key}' must be a date in YYYY-MM-DD format, got {value!r}") from None
+
+
+def _limit_arg(args: dict[str, Any]) -> int:
+    value = args.get("limit", _DEFAULT_LIMIT)
+    if value is None:
+        return _DEFAULT_LIMIT
+    if isinstance(value, bool):
+        raise _ToolError("Error: 'limit' must be an integer")
+    try:
+        limit = int(value)
+    except (TypeError, ValueError):
+        raise _ToolError("Error: 'limit' must be an integer") from None
+    return max(1, min(limit, _MAX_LIMIT))
+
+
+_NAME_DOC = "Memory name: lowercase letters, digits and '-', e.g. 'knee-injury' (no '.md')."
+
+
+def build_tools(store: Store, memory: MemoryStore, db_path: Path) -> list[SdkMcpTool]:
+    """Create the Argus tools bound to ``store``, ``memory``, and the database at ``db_path``."""
+
+    @tool(
+        "memory_list",
+        "List long-term memories: returns the MEMORY.md index, one line per memory with its "
+        "name and summary. Check this before answering questions that may depend on what you "
+        "know about the user, and before writing a memory to avoid duplicates.",
+        {"type": "object", "properties": {}},
+        annotations=_READ_ONLY,
+    )
+    @_safe
+    async def memory_list(args: dict[str, Any]) -> dict[str, Any]:
+        index = memory.index().strip()
+        return _ok(index or "(no memories)")
+
+    @tool(
+        "memory_read",
+        "Read the full content of one long-term memory by name (as shown in memory_list).",
+        {
+            "type": "object",
+            "properties": {"name": {"type": "string", "description": _NAME_DOC}},
+            "required": ["name"],
+        },
+        annotations=_READ_ONLY,
+    )
+    @_safe
+    async def memory_read(args: dict[str, Any]) -> dict[str, Any]:
+        return _ok(memory.read(_str_arg(args, "name")))
+
+    @tool(
+        "memory_write",
+        "Create or overwrite a long-term memory (Markdown). Use it to remember durable facts, "
+        "preferences, and ongoing situations about the user that will matter in future days. "
+        "Overwriting replaces the whole content, so read the memory first and merge when "
+        "updating. 'summary' is one short line shown in the memory index.",
+        {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": _NAME_DOC},
+                "content": {"type": "string", "description": "Full Markdown content of the memory."},
+                "summary": {"type": "string", "description": "One-line summary for the index."},
+            },
+            "required": ["name", "content", "summary"],
+        },
+    )
+    @_safe
+    async def memory_write(args: dict[str, Any]) -> dict[str, Any]:
+        name = _str_arg(args, "name")
+        memory.write(name, _str_arg(args, "content"), _str_arg(args, "summary"))
+        return _ok(f"saved {name}")
+
+    @tool(
+        "memory_delete",
+        "Delete a long-term memory by name. Use when it is wrong or no longer relevant.",
+        {
+            "type": "object",
+            "properties": {"name": {"type": "string", "description": _NAME_DOC}},
+            "required": ["name"],
+        },
+        annotations=ToolAnnotations(destructiveHint=True),
+    )
+    @_safe
+    async def memory_delete(args: dict[str, Any]) -> dict[str, Any]:
+        name = _str_arg(args, "name")
+        memory.delete(name)
+        return _ok(f"deleted {name}")
+
+    @tool(
+        "query_data",
+        "Run one read-only SQL (SQLite) SELECT over Argus's database and get JSON "
+        '{"columns", "rows", "truncated"} (at most 200 rows). Tables: '
+        "messages(id, ts, sender, content, session_id) — every chat message, ts is local "
+        "ISO-8601 text like '2026-10-01T09:30:00', sender is 'user' or 'argus'; "
+        "sessions(id, day, sdk_session_id, started_at, ended_at) — one per day (day rolls over "
+        "at 04:00). Use for counts, date-range and aggregate questions; use search_history to "
+        "find messages by words. Writes, PRAGMA and multiple statements are refused; to inspect "
+        "the schema run SELECT name, sql FROM sqlite_master.",
+        {
+            "type": "object",
+            "properties": {"sql": {"type": "string", "description": "A single SELECT statement."}},
+            "required": ["sql"],
+        },
+        annotations=_READ_ONLY,
+    )
+    @_safe
+    async def query_data(args: dict[str, Any]) -> dict[str, Any]:
+        result = query_readonly(db_path, _str_arg(args, "sql"))
+        return _ok(json.dumps(result, ensure_ascii=False, default=str))
+
+    @tool(
+        "search_history",
+        "Search past chat messages (both the user's and yours) for text; returns matching "
+        "messages newest first as '[ts] sender: content' lines. Every whitespace-separated "
+        "term must appear (substring match, works for Chinese). Use it to recall what was "
+        "said before, e.g. when the user refers to an earlier conversation. Optionally limit "
+        "to an inclusive date range with start/end (YYYY-MM-DD).",
+        {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Words to search for."},
+                "start": {"type": "string", "description": "Earliest date, YYYY-MM-DD (inclusive)."},
+                "end": {"type": "string", "description": "Latest date, YYYY-MM-DD (inclusive)."},
+                "limit": {
+                    "type": "integer",
+                    "description": f"Max results (default {_DEFAULT_LIMIT}, max {_MAX_LIMIT}).",
+                },
+            },
+            "required": ["query"],
+        },
+        annotations=_READ_ONLY,
+    )
+    @_safe
+    async def search_history(args: dict[str, Any]) -> dict[str, Any]:
+        query = _str_arg(args, "query")
+        start = _date_arg(args, "start")
+        end = _date_arg(args, "end")
+        rows = store.search_messages(query, start=start, end=end, limit=_limit_arg(args))
+        return _ok(format_history(rows))
+
+    return [memory_list, memory_read, memory_write, memory_delete, query_data, search_history]
+
+
+def build_tool_server(
+    store: Store, memory: MemoryStore, db_path: Path
+) -> tuple[McpSdkServerConfig, list[str]]:
+    """Return the SDK MCP server config and the ``mcp__argus__<tool>`` names to allow."""
+    tools = build_tools(store, memory, db_path)
+    server = create_sdk_mcp_server(SERVER_NAME, tools=tools)
+    allowed = [f"mcp__{SERVER_NAME}__{t.name}" for t in tools]
+    return server, allowed
