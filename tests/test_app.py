@@ -1,4 +1,6 @@
 import asyncio
+import json
+import logging
 from datetime import datetime
 import pytest
 from argus.app import App, SLOW_NOTICE, STOPPED_REPLY, NOTHING_TO_STOP, NOTHING_TO_RETRY
@@ -17,9 +19,9 @@ class FakeChannel(Channel):
         self.sent.append(text)
 
 class FakeBrain:
-    def __init__(self): self.asked, self.gate, self.fail, self.interrupts = [], None, None, 0
-    async def ask(self, text):
-        self.asked.append(text)
+    def __init__(self): self.asked, self.ats, self.gate, self.fail, self.interrupts = [], [], None, None, 0
+    async def ask(self, text, at=None):
+        self.asked.append(text); self.ats.append(at)
         if self.fail: e, self.fail = self.fail, None; raise e
         if self.gate:
             self._stop = asyncio.Event()
@@ -69,9 +71,9 @@ async def test_error_then_retry(parts):
     app, ch, br, s = parts
     br.fail = SessionError("额度用完")
     ch.push("hello"); await run_until_idle(app)
-    assert ch.sent == ["出错了：额度用完"] and s.get_state("last_failed") == "hello"
+    assert ch.sent == ["出错了：额度用完"] and json.loads(s.get_state("last_failed")) == ["hello"]
     ch.push("重试"); await run_until_idle(app)
-    assert ch.sent[-1] == "re:hello" and not s.get_state("last_failed")
+    assert ch.sent[-1] == "re:hello" and json.loads(s.get_state("last_failed")) == []
 
 async def test_retry_with_nothing(parts):
     app, ch, _, _ = parts
@@ -88,3 +90,89 @@ async def test_unexpected_error_reported(parts):
     br.fail = RuntimeError("bug")
     ch.push("x"); await run_until_idle(app)
     assert ch.sent == ["出错了：RuntimeError"]
+
+
+async def test_passes_send_time_to_brain(parts):
+    app, ch, br, _ = parts
+    ch.push("a"); await run_until_idle(app)
+    assert br.ats == [datetime(2026, 10, 1)]
+
+async def test_restart_answers_pending_messages(parts):
+    app, ch, br, s = parts
+    old = [IncomingMessage(id="G1", text="first", received_at=datetime(2026, 10, 1, 9)),
+           IncomingMessage(id="G2", text="second", received_at=datetime(2026, 10, 1, 10))]
+    s.accept_messages(old, "imessage_last_rowid", "2")
+    await run_until_idle(app)
+    assert ch.sent == ["re:first", "re:second"]
+    assert br.ats == [datetime(2026, 10, 1, 9), datetime(2026, 10, 1, 10)]
+    assert s.list_pending() == []
+
+async def test_pending_removed_after_error_and_control_words(parts):
+    app, ch, br, s = parts
+    br.fail = SessionError("x")
+    msgs = [IncomingMessage(id="G1", text="boom", received_at=datetime(2026, 10, 1, 9)),
+            IncomingMessage(id="G2", text="停", received_at=datetime(2026, 10, 1, 10))]
+    s.accept_messages(msgs, "imessage_last_rowid", "2")
+    await run_until_idle(app)
+    assert s.list_pending() == []
+
+async def test_retry_requeues_all_failures_in_order(parts):
+    app, ch, br, s = parts
+    br.fail = SessionError("x"); ch.push("one"); await run_until_idle(app)
+    br.fail = SessionError("x"); ch.push("two"); await run_until_idle(app)
+    assert json.loads(s.get_state("last_failed")) == ["one", "two"]
+    ch.push("重试"); await run_until_idle(app)
+    assert ch.sent[-2:] == ["re:one", "re:two"] and json.loads(s.get_state("last_failed")) == []
+
+async def test_retry_tolerates_legacy_string(parts):
+    app, ch, _, s = parts
+    s.set_state("last_failed", "old")
+    ch.push("重试"); await run_until_idle(app)
+    assert ch.sent == ["re:old"]
+
+async def test_failure_list_is_capped(parts):
+    app, ch, br, s = parts
+    s.set_state("last_failed", json.dumps([f"m{i}" for i in range(20)]))
+    br.fail = SessionError("x"); ch.push("new"); await run_until_idle(app)
+    failed = json.loads(s.get_state("last_failed"))
+    assert len(failed) == 20 and failed[-1] == "new" and failed[0] == "m1"
+
+async def test_worker_restarted_after_external_cancel(parts):
+    app, ch, br, _ = parts
+    task = asyncio.create_task(app.run())
+    ch.push("a"); await asyncio.sleep(0.05); await app.drain()
+    app._worker_task.cancel()
+    await asyncio.sleep(0.05)
+    ch.push("b"); await asyncio.sleep(0.05)
+    await asyncio.wait_for(app.drain(), 2)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError): await task
+    assert ch.sent == ["re:a", "re:b"]
+
+class FlakyChannel(FakeChannel):
+    def __init__(self, failures):
+        super().__init__(); self.failures = failures
+    def poll(self):
+        if self.failures: self.failures -= 1; raise OSError("db locked")
+        return super().poll()
+
+async def test_poll_errors_rate_limited_and_notified_once(tmp_path, caplog):
+    s = Store(tmp_path / "a.db"); ch, br = FlakyChannel(8), FakeBrain(); notes = []
+    app = App(ch, br, s, poll_interval=0.001, slow_notice_seconds=1,
+              on_poll_failure=notes.append, poll_failure_notify_after=3, poll_error_log_interval=3600)
+    caplog.set_level(logging.INFO, logger="argus.app")
+    try:
+        ch.push("hi")
+        task = asyncio.create_task(app.run())
+        for _ in range(200):
+            if ch.sent: break
+            await asyncio.sleep(0.01)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError): await task
+    finally:
+        s.close()
+    assert ch.sent == ["re:hi"]
+    errors = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert len(errors) == 1 and errors[0].exc_info is not None
+    assert any("polling recovered" in r.getMessage() for r in caplog.records)
+    assert len(notes) == 1

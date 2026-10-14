@@ -33,14 +33,15 @@ fi
 mkdir -p logs
 
 # 3. Render the LaunchAgent.
-# Escape characters that are special in a sed replacement or in XML.
-root_xml="$ROOT"
-root_xml="${root_xml//&/&amp;}"
-root_xml="${root_xml//</&lt;}"
-root_xml="${root_xml//>/&gt;}"
-root_sed="$(printf '%s' "$root_xml" | sed -e 's/[\\|&]/\\&/g')"
+# Escape characters that are special in XML, then in a sed replacement.
+escape_for_plist() {
+    # (sed, not ${v//...}: bash 5.2's patsub_replacement treats & in a replacement specially.)
+    printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' -e 's/[\\|&]/\\&/g'
+}
+root_sed="$(escape_for_plist "$ROOT")"
+home_sed="$(escape_for_plist "$HOME")"
 mkdir -p "$(dirname "$PLIST")"
-sed "s|__ROOT__|$root_sed|g" "$TEMPLATE" > "$PLIST.tmp"
+sed -e "s|__ROOT__|$root_sed|g" -e "s|__HOME__|$home_sed|g" "$TEMPLATE" > "$PLIST.tmp"
 plutil -lint "$PLIST.tmp" >/dev/null
 mv "$PLIST.tmp" "$PLIST"
 echo "==> Wrote $PLIST"

@@ -32,18 +32,21 @@ _LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
 
 
 def setup_logging(logs_dir: Path) -> None:
-    """Log INFO+ to ``logs/argus.log`` (rotated at midnight, 30 kept) and to stderr."""
+    """Log INFO+ to ``logs/argus.log`` (rotated at midnight, 30 kept), and to stderr when it is a
+    terminal. Under launchd stderr is the unrotated ``logs/launchd.err``, so it is skipped there."""
     logs_dir.mkdir(parents=True, exist_ok=True)
     formatter = logging.Formatter(_LOG_FORMAT)
     file_handler = logging.handlers.TimedRotatingFileHandler(
         logs_dir / "argus.log", when="midnight", backupCount=30, encoding="utf-8"
     )
-    stderr_handler = logging.StreamHandler(sys.stderr)
+    handlers: list[logging.Handler] = [file_handler]
+    if sys.stderr is not None and sys.stderr.isatty():
+        handlers.append(logging.StreamHandler(sys.stderr))
     root = logging.getLogger()
     for h in list(root.handlers):
         root.removeHandler(h)
         h.close()
-    for h in (file_handler, stderr_handler):
+    for h in handlers:
         h.setFormatter(formatter)
         root.addHandler(h)
     root.setLevel(logging.INFO)
@@ -75,6 +78,7 @@ def build_app(cfg: Config) -> App:
         store,
         poll_interval=cfg.poll_interval,
         slow_notice_seconds=cfg.slow_notice_seconds,
+        on_poll_failure=notify,
     )
 
 
@@ -141,13 +145,16 @@ async def _serve(cfg: Config, app: App) -> int:
 
 
 def main() -> int:
+    """Exit codes: 0 for a clean stop and for setup problems a restart cannot fix (bad config,
+    unreadable chat.db), so launchd's ``KeepAlive {SuccessfulExit: false}`` does not loop on
+    them; 1 for unexpected crashes, which launchd restarts."""
     root = Path(__file__).resolve().parent.parent
     try:
         cfg = load_config(root)
     except Exception as e:
         print(f"Argus: invalid configuration: {e}", file=sys.stderr)
         notify(f"Argus cannot start: {e}")
-        return 1
+        return 0
     setup_logging(cfg.logs_dir)
 
     try:
@@ -160,7 +167,7 @@ def main() -> int:
             cfg.chat_db, e, real_python,
         )
         notify("Cannot read chat.db. Grant Full Disk Access to Python (see logs/argus.log).")
-        return 1
+        return 0
 
     try:
         return asyncio.run(_serve(cfg, app))

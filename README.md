@@ -38,7 +38,7 @@ Argus runs under launchd as `.venv/bin/python`, which is a symlink to the real P
 
    Then open System Settings → Privacy & Security → Full Disk Access, click +, press Cmd+Shift+G, paste that path, and add it. Granting Full Disk Access to Terminal alone is not enough for the LaunchAgent. Upgrading Python changes the path, so grant it again after an upgrade (and re-run `./setup.sh`).
 
-   If Argus cannot read chat.db at startup, it logs the error, shows a macOS notification, and exits; launchd retries every 10 seconds.
+   If Argus cannot read chat.db at startup (or `argus.toml` is invalid), it logs the error, shows one macOS notification, and exits cleanly; launchd does not restart it (the LaunchAgent only restarts Argus after a crash). Fix the problem, then start it again with `launchctl kickstart -k gui/$(id -u)/com.argus.agent`.
 
 2. **Automation → Messages** (to send replies via AppleScript). macOS asks the first time Argus sends a message; click Allow. You can review it under System Settings → Privacy & Security → Automation.
 
@@ -56,8 +56,9 @@ Open the conversation with yourself in Messages on your iPhone and type normally
 
 - If a reply takes more than 15 seconds, Argus first sends `🤖 收到，正在处理…`.
 - Send `停` to stop the task Argus is working on.
-- Send `重试` to retry the last message that failed with an error.
-- Messages sent while Argus is busy are queued and answered in order.
+- Send `重试` to retry the messages that failed with an error (all of them, in order; the last 20 are remembered).
+- Messages sent while Argus is busy are queued and answered in order. The queue is saved, so messages that were waiting when Argus restarted are answered after it comes back.
+- If Argus cannot read new messages for about a minute, it shows a macOS notification (once per outage).
 
 ## Where data lives
 
@@ -70,9 +71,27 @@ Everything personal stays on the Mac and is git-ignored:
 | `memory/` | Argus's long-term memory (`MEMORY.md` index + one Markdown file per topic) |
 | `backups/YYYY-MM-DD/` | Daily snapshot of `data/argus.db` and `memory/`, taken at 04:00; newest 30 kept |
 | `logs/argus.log` | Application log, rotated daily, 30 days kept |
-| `logs/launchd.out`, `logs/launchd.err` | Raw stdout/stderr captured by launchd |
+| `logs/launchd.out`, `logs/launchd.err` | Raw stdout/stderr captured by launchd (only output that bypasses logging, e.g. a crash before logging starts) |
 
 Argus's persona and rules are in `CLAUDE.md`.
+
+### Restoring a backup
+
+1. Stop Argus: `launchctl bootout gui/$(id -u)/com.argus.agent`.
+2. Copy the backup back: `cp backups/YYYY-MM-DD/argus.db data/argus.db` and replace `memory/` with `backups/YYYY-MM-DD/memory/`.
+3. Delete the restored message checkpoint and queue, so Argus does not replay every iMessage sent since the backup was taken:
+
+   ```sh
+   sqlite3 data/argus.db "DELETE FROM state WHERE key='imessage_last_rowid'; DELETE FROM pending;"
+   ```
+
+   On the next start, the channel re-initializes the checkpoint to the newest message in chat.db.
+4. Start Argus again: `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.argus.agent.plist`.
+
+## Security notes
+
+- Argus can search the web (WebSearch) but **cannot fetch arbitrary URLs: WebFetch is intentionally disabled**. A web page or search result could carry a prompt injection; without WebFetch, an injected instruction cannot make Argus send your memory or message history to an attacker-controlled URL.
+- Automatic login (needed so the LaunchAgent starts after a reboot) is unavailable while FileVault is on; decide which you prefer for this machine.
 
 ## Stopping and starting
 
