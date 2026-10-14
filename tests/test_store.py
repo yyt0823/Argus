@@ -389,3 +389,91 @@ def test_fitness_tables_survive_reopen(tmp_path):
     p = tmp_path / "x.db"
     s = Store(p); _food(s); s.close()
     s2 = Store(p); assert len(s2.foods_for_day(D1)) == 1; s2.close()
+
+
+# --- jobs: postings and runs ---
+
+from datetime import timedelta
+
+def _posting(**kw):
+    p = {"company": "Acme", "role": "SWE Intern", "city": "Montréal", "term": "Winter 2027",
+         "deadline": "2026-11-01", "fit": 4, "notes": "Python", "url": "https://acme.example/jobs/1",
+         "verified": True, "ats": "workday"}
+    p.update(kw)
+    return p
+
+def test_upsert_posting_insert_and_get(store):
+    pid = store.upsert_posting(_posting())
+    p = store.get_posting(pid)
+    assert p["company"] == "Acme" and p["fit"] == 4 and p["status"] == "new"
+    assert p["verified"] is True and p["first_seen_at"]
+    assert store.get_posting(9999) is None
+
+def test_upsert_posting_by_url_keeps_status(store):
+    pid = store.upsert_posting(_posting())
+    store.set_posting_status(pid, "queued")
+    first = store.get_posting(pid)["first_seen_at"]
+    pid2 = store.upsert_posting(_posting(fit=5, notes="updated"))
+    assert pid2 == pid
+    p = store.get_posting(pid)
+    assert p["status"] == "queued" and p["fit"] == 5 and p["notes"] == "updated"
+    assert p["first_seen_at"] == first
+    store.upsert_posting(_posting(status="skipped"))
+    assert store.get_posting(pid)["status"] == "skipped"
+
+def test_upsert_posting_validation(store):
+    with pytest.raises(ValueError):
+        store.upsert_posting(_posting(url=""))
+    with pytest.raises(ValueError):
+        store.upsert_posting(_posting(status="bogus"))
+    with pytest.raises(ValueError):
+        store.upsert_posting(_posting(fit=9))
+    pid = store.upsert_posting({"url": "https://x.example/2"})
+    p = store.get_posting(pid)
+    assert p["company"] is None and p["fit"] is None and p["verified"] is None
+
+def test_set_posting_status(store):
+    pid = store.upsert_posting(_posting())
+    at = datetime(2026, 10, 14, 10, 0)
+    store.set_posting_status(pid, "submitted", detail="ok", applied_at=at, follow_up="watch email")
+    p = store.get_posting(pid)
+    assert p["status"] == "submitted" and p["status_detail"] == "ok"
+    assert p["applied_at"] == "2026-10-14T10:00:00" and p["follow_up"] == "watch email"
+    with pytest.raises(ValueError):
+        store.set_posting_status(pid, "nope")
+    with pytest.raises(KeyError):
+        store.set_posting_status(4242, "new")
+
+def test_list_postings_filters(store):
+    a = store.upsert_posting(_posting(url="u1", fit=5))
+    b = store.upsert_posting(_posting(url="u2", fit=3))
+    c = store.upsert_posting(_posting(url="u3", fit=None))
+    store.set_posting_status(b, "submitted")
+    assert {p["id"] for p in store.list_postings()} == {a, b, c}
+    assert [p["id"] for p in store.list_postings(status="submitted")] == [b]
+    assert [p["id"] for p in store.list_postings(min_fit=4)] == [a]
+    assert store.list_postings(since=datetime.now() + timedelta(days=1)) == []
+    assert len(store.list_postings(since=datetime.now() - timedelta(days=1))) == 3
+    assert len(store.list_postings(limit=2)) == 2
+    with pytest.raises(ValueError):
+        store.list_postings(status="bad")
+
+def test_count_applied_on(store):
+    a = store.upsert_posting(_posting(url="u1"))
+    b = store.upsert_posting(_posting(url="u2"))
+    c = store.upsert_posting(_posting(url="u3"))
+    store.set_posting_status(a, "submitted", applied_at=datetime(2026, 10, 14, 9, 0))
+    store.set_posting_status(b, "needs_attestation", applied_at=datetime(2026, 10, 14, 23, 0))
+    store.set_posting_status(c, "submitted", applied_at=datetime(2026, 10, 15, 0, 30))
+    assert store.count_applied_on(date(2026, 10, 14)) == 2
+    assert store.count_applied_on(date(2026, 10, 15)) == 1
+    assert store.count_applied_on(date(2026, 10, 13)) == 0
+
+def test_job_runs(store):
+    rid = store.add_job_run("scout", datetime(2026, 10, 14, 7, 30))
+    store.finish_job_run(rid, datetime(2026, 10, 14, 7, 45), True, "3 new", 0.42)
+    row = store.get_job_run(rid)
+    assert row["kind"] == "scout" and row["ok"] is True and row["summary"] == "3 new"
+    assert row["cost_usd"] == 0.42 and row["finished_at"] == "2026-10-14T07:45:00"
+    with pytest.raises(ValueError):
+        store.add_job_run("other", datetime(2026, 10, 14))

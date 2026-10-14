@@ -142,3 +142,65 @@ def test_fitness_must_be_table(tmp_path: Path):
     _write(tmp_path, 'fitness = 1\n')
     with pytest.raises(ValueError, match="fitness"):
         load_config(tmp_path)
+
+# --- [jobs] table ---
+
+from argus.config import JobsConfig
+
+def test_jobs_defaults(tmp_path: Path):
+    _write(tmp_path)
+    cfg = load_config(tmp_path)
+    j = cfg.jobs
+    assert j == JobsConfig()
+    assert j.enabled is True and j.auto_apply is True
+    assert j.scout_time == time(7, 30)
+    assert j.min_fit_apply == 4 and j.daily_apply_limit == 8
+    assert j.apply_window == (time(8, 30), time(22, 0))
+    assert j.cli_path == "/opt/homebrew/bin/claude"
+    assert cfg.jobs_internships_dir == tmp_path / "data" / "about_me" / "internships"
+    assert cfg.jobs_resume_path == tmp_path / "data" / "about_me" / "yantian_yin_cv.pdf"
+    assert cfg.jobs_about_me_dir == tmp_path / "data" / "about_me"
+
+def test_jobs_table_parsed(tmp_path: Path):
+    _write(tmp_path, '[jobs]\nenabled = false\nscout_time = "06:05"\nauto_apply = false\nmin_fit_apply = 5\n'
+                     'daily_apply_limit = 0\napply_window = ["09:00", "21:30"]\n'
+                     'internships_dir = "x/intern"\nresume_path = "/abs/cv.pdf"\ncli_path = "/usr/local/bin/claude"\n')
+    cfg = load_config(tmp_path)
+    assert cfg.jobs == JobsConfig(
+        enabled=False, scout_time=time(6, 5), auto_apply=False, min_fit_apply=5, daily_apply_limit=0,
+        apply_window=(time(9, 0), time(21, 30)), internships_dir="x/intern", resume_path="/abs/cv.pdf",
+        cli_path="/usr/local/bin/claude",
+    )
+    assert cfg.jobs_internships_dir == tmp_path / "x" / "intern"
+    assert cfg.jobs_resume_path == Path("/abs/cv.pdf")
+    assert cfg.jobs_about_me_dir == tmp_path / "x"
+
+def test_jobs_in_apply_window():
+    j = JobsConfig()
+    assert j.in_apply_window(time(8, 30)) and j.in_apply_window(time(21, 59))
+    assert not j.in_apply_window(time(22, 0)) and not j.in_apply_window(time(7, 0))
+
+@pytest.mark.parametrize("extra", [
+    'jobs = 1\n',
+    '[jobs]\nbogus = 1\n',
+    '[jobs]\nenabled = "yes"\n',
+    '[jobs]\nauto_apply = 1\n',
+    '[jobs]\nscout_time = "7:30"\n',
+    '[jobs]\nscout_time = "24:00"\n',
+    '[jobs]\nmin_fit_apply = 0\n',
+    '[jobs]\nmin_fit_apply = 6\n',
+    '[jobs]\nmin_fit_apply = 4.5\n',
+    '[jobs]\nmin_fit_apply = true\n',
+    '[jobs]\ndaily_apply_limit = -1\n',
+    '[jobs]\napply_window = ["08:30"]\n',
+    '[jobs]\napply_window = ["08:30", "25:00"]\n',
+    '[jobs]\napply_window = ["22:00", "08:30"]\n',
+    '[jobs]\napply_window = "08:30-22:00"\n',
+    '[jobs]\ninternships_dir = ""\n',
+    '[jobs]\nresume_path = 3\n',
+    '[jobs]\ncli_path = "  "\n',
+])
+def test_jobs_invalid(tmp_path: Path, extra):
+    _write(tmp_path, extra)
+    with pytest.raises(ValueError, match="jobs"):
+        load_config(tmp_path)

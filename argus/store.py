@@ -1,5 +1,5 @@
 """SQLite persistence for ``data/argus.db``: message archive, sessions, sent ids, key/value state,
-mail triage verdicts, and fitness logs (food, weight, workouts).
+mail triage verdicts, fitness logs (food, weight, workouts), and job postings/runs.
 
 This module is the only writer of the database.
 """
@@ -98,6 +98,34 @@ CREATE TABLE IF NOT EXISTS workout_log (
     note TEXT
 );
 CREATE INDEX IF NOT EXISTS workout_log_day ON workout_log (day);
+CREATE TABLE IF NOT EXISTS job_postings (
+    id INTEGER PRIMARY KEY,
+    company TEXT,
+    role TEXT,
+    city TEXT,
+    term TEXT,
+    deadline TEXT,
+    fit INTEGER,
+    notes TEXT,
+    url TEXT NOT NULL UNIQUE,
+    verified INTEGER,
+    ats TEXT,
+    first_seen_at TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'new',
+    status_detail TEXT,
+    applied_at TEXT,
+    follow_up TEXT
+);
+CREATE INDEX IF NOT EXISTS job_postings_status ON job_postings (status);
+CREATE TABLE IF NOT EXISTS job_runs (
+    id INTEGER PRIMARY KEY,
+    kind TEXT NOT NULL CHECK (kind IN ('scout','apply')),
+    started_at TEXT NOT NULL,
+    finished_at TEXT,
+    ok INTEGER,
+    summary TEXT,
+    cost_usd REAL
+);
 """
 
 # Rebuilds ``messages`` (keeping ids) with the current sender CHECK; run inside one transaction.
@@ -133,6 +161,12 @@ _FOOD_UPDATABLE = (
 _FOOD_COLUMNS = (
     "id, day, logged_at, meal, description, kcal, protein_g, fat_g, carbs_g, added_sugar_g, sodium, note, deleted"
 )
+
+JOB_STATUSES = (
+    "new", "reported", "queued", "applying", "submitted", "needs_login", "needs_attestation", "skipped", "error",
+)
+JOB_RUN_KINDS = ("scout", "apply")
+_POSTING_FIELDS = ("company", "role", "city", "term", "deadline", "fit", "notes", "verified", "ats")
 
 # The trigram tokenizer cannot match terms shorter than 3 characters.
 _MIN_FTS_TERM = 3
@@ -545,6 +579,132 @@ class Store:
             (len(IMPORTED_PREFIX), IMPORTED_PREFIX),
         )
         return {date.fromisoformat(r["day"]) for r in rows}
+
+    # --- jobs: postings (one row per URL) and scout/apply runs ---
+
+    def upsert_posting(self, posting: dict) -> int:
+        """Insert or update the posting with ``posting["url"]``; return its id.
+
+        Missing fields are stored as NULL. On update, ``first_seen_at`` is kept and ``status``
+        is kept unless ``posting`` has a ``status``. Raise ``ValueError`` on invalid values.
+        """
+        url = _check_text("url", posting.get("url"))
+        values: dict = {}
+        for name in _POSTING_FIELDS:
+            value = posting.get(name)
+            if name == "fit" and value is not None:
+                if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 5:
+                    raise ValueError(f"fit must be an integer 1-5, got {value!r}")
+            elif name == "verified" and value is not None:
+                value = int(bool(value))
+            elif value is not None and name != "fit":
+                value = str(value)
+            values[name] = value
+        status = posting.get("status")
+        if status is not None:
+            _check_choice("status", status, JOB_STATUSES, nullable=False)
+        updates = [f"{k} = excluded.{k}" for k in values]
+        if status is not None:
+            updates.append("status = excluded.status")
+        cols = {"url": url, **values, "first_seen_at": _ts(datetime.now()), "status": status or "new"}
+        with self._lock, self._conn:
+            self._conn.execute(
+                f"INSERT INTO job_postings ({', '.join(cols)}) VALUES ({', '.join('?' * len(cols))}) "
+                f"ON CONFLICT(url) DO UPDATE SET {', '.join(updates)}",
+                tuple(cols.values()),
+            )
+            return self._conn.execute("SELECT id FROM job_postings WHERE url = ?", (url,)).fetchone()["id"]
+
+    def get_posting(self, id: int) -> dict | None:
+        rows = self._read("SELECT * FROM job_postings WHERE id = ?", (id,))
+        return _posting_dict(rows[0]) if rows else None
+
+    def list_postings(
+        self,
+        status: str | None = None,
+        min_fit: int | None = None,
+        since: datetime | None = None,
+        limit: int = 50,
+    ) -> list[dict]:
+        """Postings, best fit first then newest; ``since`` filters on ``first_seen_at``."""
+        where, params = ["1 = 1"], []
+        if status is not None:
+            _check_choice("status", status, JOB_STATUSES, nullable=False)
+            where.append("status = ?")
+            params.append(status)
+        if min_fit is not None:
+            where.append("fit >= ?")
+            params.append(min_fit)
+        if since is not None:
+            where.append("first_seen_at >= ?")
+            params.append(_ts(since))
+        rows = self._read(
+            f"SELECT * FROM job_postings WHERE {' AND '.join(where)} "
+            "ORDER BY fit IS NULL, fit DESC, first_seen_at DESC, id DESC LIMIT ?",
+            (*params, limit),
+        )
+        return [_posting_dict(r) for r in rows]
+
+    def set_posting_status(
+        self,
+        id: int,
+        status: str,
+        detail: str | None = None,
+        applied_at: datetime | None = None,
+        follow_up: str | None = None,
+    ) -> None:
+        """Set ``status`` and ``status_detail``; ``applied_at``/``follow_up`` are only changed when given.
+
+        Raise ``ValueError`` for an unknown status, ``KeyError`` if the posting is missing.
+        """
+        _check_choice("status", status, JOB_STATUSES, nullable=False)
+        sets, params = ["status = ?", "status_detail = ?"], [status, detail]
+        if applied_at is not None:
+            sets.append("applied_at = ?")
+            params.append(_ts(applied_at))
+        if follow_up is not None:
+            sets.append("follow_up = ?")
+            params.append(follow_up)
+        cur = self._write(f"UPDATE job_postings SET {', '.join(sets)} WHERE id = ?", (*params, id))
+        if cur.rowcount == 0:
+            raise KeyError(f"job posting {id} not found")
+
+    def count_applied_on(self, day: date) -> int:
+        """Postings whose ``applied_at`` falls on calendar day ``day`` (any resulting status)."""
+        rows = self._read(
+            "SELECT COUNT(*) AS n FROM job_postings WHERE applied_at >= ? AND applied_at < ?",
+            (day.isoformat(), (day + timedelta(days=1)).isoformat()),
+        )
+        return rows[0]["n"]
+
+    def add_job_run(self, kind: str, started_at: datetime) -> int:
+        _check_choice("kind", kind, JOB_RUN_KINDS, nullable=False)
+        cur = self._write("INSERT INTO job_runs (kind, started_at) VALUES (?, ?)", (kind, _ts(started_at)))
+        return cur.lastrowid
+
+    def finish_job_run(
+        self, id: int, finished_at: datetime, ok: bool, summary: str | None, cost_usd: float | None
+    ) -> None:
+        self._write(
+            "UPDATE job_runs SET finished_at = ?, ok = ?, summary = ?, cost_usd = ? WHERE id = ?",
+            (_ts(finished_at), int(bool(ok)), summary, cost_usd, id),
+        )
+
+    def get_job_run(self, id: int) -> dict | None:
+        rows = self._read("SELECT * FROM job_runs WHERE id = ?", (id,))
+        if not rows:
+            return None
+        d = dict(rows[0])
+        if d["ok"] is not None:
+            d["ok"] = bool(d["ok"])
+        return d
+
+
+def _posting_dict(row: sqlite3.Row) -> dict:
+    d = dict(row)
+    if d["verified"] is not None:
+        d["verified"] = bool(d["verified"])
+    return d
 
 
 def _triage_dict(row: sqlite3.Row) -> dict:

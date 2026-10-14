@@ -55,6 +55,25 @@ class FitnessConfig:
 
 
 @dataclass(frozen=True)
+class JobsConfig:
+    """The optional ``[jobs]`` table: daily internship scout and automatic applications."""
+
+    enabled: bool = True
+    scout_time: time = time(7, 30)
+    auto_apply: bool = True
+    min_fit_apply: int = 4  # on the tracker's 1-5 scale
+    daily_apply_limit: int = 8
+    apply_window: tuple[time, time] = (time(8, 30), time(22, 0))
+    internships_dir: str = "data/about_me/internships"
+    resume_path: str = "data/about_me/yantian_yin_cv.pdf"
+    cli_path: str = "/opt/homebrew/bin/claude"
+
+    def in_apply_window(self, t: time) -> bool:
+        """True if ``t`` is in ``[apply_window[0], apply_window[1])``."""
+        return self.apply_window[0] <= t < self.apply_window[1]
+
+
+@dataclass(frozen=True)
 class Config:
     root: Path
     # "self": Messages is signed into the user's own Apple ID; self_handles are the user's handles.
@@ -70,6 +89,7 @@ class Config:
     mode: str = "self"
     mail: MailConfig = field(default_factory=MailConfig)
     fitness: FitnessConfig = field(default_factory=FitnessConfig)
+    jobs: JobsConfig = field(default_factory=JobsConfig)
 
     @property
     def data_dir(self) -> Path:
@@ -95,6 +115,21 @@ class Config:
     def fitness_plan_path(self) -> Path:
         """``fitness.plan_path`` resolved against ``root`` (absolute paths are kept)."""
         return self.root / Path(self.fitness.plan_path).expanduser()
+
+    @property
+    def jobs_internships_dir(self) -> Path:
+        """``jobs.internships_dir`` resolved against ``root`` (absolute paths are kept)."""
+        return self.root / Path(self.jobs.internships_dir).expanduser()
+
+    @property
+    def jobs_about_me_dir(self) -> Path:
+        """The parent of the internships directory: the user's ``about_me`` archive."""
+        return self.jobs_internships_dir.parent
+
+    @property
+    def jobs_resume_path(self) -> Path:
+        """``jobs.resume_path`` resolved against ``root`` (absolute paths are kept)."""
+        return self.root / Path(self.jobs.resume_path).expanduser()
 
 
 MODES = ("self", "contact")
@@ -128,6 +163,7 @@ def load_config(root: Path) -> Config:
         kwargs["chat_db"] = Path(raw["chat_db"]).expanduser()
     kwargs["mail"] = _load_mail(raw.get("mail", {}), path)
     kwargs["fitness"] = _load_fitness(raw.get("fitness", {}), path)
+    kwargs["jobs"] = _load_jobs(raw.get("jobs", {}), path)
     return Config(root=root, self_handles=tuple(h.strip() for h in handles), **kwargs)
 
 
@@ -229,3 +265,61 @@ def _load_fitness(raw: object, path: Path) -> FitnessConfig:
                 )
             kwargs[key] = (value[0], value[1])
     return FitnessConfig(**kwargs)
+
+
+_JOBS_BOOL_KEYS = ("enabled", "auto_apply")
+_JOBS_PATH_KEYS = ("internships_dir", "resume_path", "cli_path")
+_JOBS_KEYS = (
+    *_JOBS_BOOL_KEYS, *_JOBS_PATH_KEYS, "scout_time", "min_fit_apply", "daily_apply_limit", "apply_window",
+)
+
+
+def _hhmm(value: object) -> time | None:
+    m = _HHMM.fullmatch(value) if isinstance(value, str) else None
+    return time(int(m[1]), int(m[2])) if m else None
+
+
+def _load_jobs(raw: object, path: Path) -> JobsConfig:
+    """Validate the optional ``[jobs]`` table; raise ``ValueError`` naming ``jobs.<key>``."""
+    if not isinstance(raw, dict):
+        raise ValueError(f"{path}: jobs must be a table ([jobs])")
+    unknown = sorted(set(raw) - set(_JOBS_KEYS))
+    if unknown:
+        raise ValueError(f"{path}: unknown key(s) in [jobs]: {', '.join('jobs.' + k for k in unknown)}")
+
+    kwargs: dict = {}
+    for key in _JOBS_BOOL_KEYS:
+        if key in raw:
+            if not isinstance(raw[key], bool):
+                raise ValueError(f"{path}: jobs.{key} must be true or false")
+            kwargs[key] = raw[key]
+    for key in _JOBS_PATH_KEYS:
+        if key in raw:
+            value = raw[key]
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"{path}: jobs.{key} must be a non-empty string, got {value!r}")
+            kwargs[key] = value.strip()
+    if "scout_time" in raw:
+        t = _hhmm(raw["scout_time"])
+        if t is None:
+            raise ValueError(f'{path}: jobs.scout_time must be a "HH:MM" string, got {raw["scout_time"]!r}')
+        kwargs["scout_time"] = t
+    if "min_fit_apply" in raw:
+        value = raw["min_fit_apply"]
+        if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 5:
+            raise ValueError(f"{path}: jobs.min_fit_apply must be an integer 1-5, got {value!r}")
+        kwargs["min_fit_apply"] = value
+    if "daily_apply_limit" in raw:
+        value = raw["daily_apply_limit"]
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError(f"{path}: jobs.daily_apply_limit must be a non-negative integer, got {value!r}")
+        kwargs["daily_apply_limit"] = value
+    if "apply_window" in raw:
+        value = raw["apply_window"]
+        times = [_hhmm(v) for v in value] if isinstance(value, list) and len(value) == 2 else None
+        if times is None or None in times or not times[0] < times[1]:
+            raise ValueError(
+                f'{path}: jobs.apply_window must be ["HH:MM", "HH:MM"] with start < end, got {value!r}'
+            )
+        kwargs["apply_window"] = (times[0], times[1])
+    return JobsConfig(**kwargs)
