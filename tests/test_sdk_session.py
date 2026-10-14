@@ -108,7 +108,47 @@ async def test_factory_builds_options(tmp_path: Path):
     assert made[0].connected and s.sdk_session_id == "prev-id"
     assert o.resume == "prev-id" and o.model == "sonnet" and o.cwd == str(tmp_path)
     assert o.system_prompt.startswith("You are Argus.")
-    assert o.tools == ["WebSearch", "WebFetch"] and "mcp__argus__memory_write" in o.allowed_tools
+    assert o.tools == ["WebSearch"] and "mcp__argus__memory_write" in o.allowed_tools
+    assert "WebFetch" not in o.allowed_tools and "WebSearch" in o.allowed_tools
     assert o.permission_mode == "dontAsk" and o.setting_sources == [] and o.strict_mcp_config
     assert set(o.mcp_servers) == {"argus"} and o.max_turns == 30
     store.close()
+
+
+# --- review fixes ---
+import asyncio
+import argus.sdk_session as sdk_session_mod
+
+
+async def test_start_wraps_plain_exception_as_session_error():
+    class Timeout(FakeClient):
+        async def connect(self, prompt=None):
+            raise Exception("Control request timeout: initialize")
+    s = SDKSession(ClaudeAgentOptions(), client=Timeout())
+    with pytest.raises(SessionError, match="Control request timeout"):
+        await s.start()
+
+
+async def test_interrupt_is_bounded_when_client_hangs(monkeypatch):
+    monkeypatch.setattr(sdk_session_mod, "INTERRUPT_TIMEOUT", 0.05)
+    class Hang(FakeClient):
+        async def interrupt(self):
+            await asyncio.sleep(3600)
+    s = SDKSession(ClaudeAgentOptions(), client=Hang())
+    await s.start()
+    await asyncio.wait_for(s.interrupt(), timeout=1)
+    assert s._interrupted
+
+
+async def test_interrupt_swallows_plain_exception():
+    class Bad(FakeClient):
+        async def interrupt(self):
+            raise Exception("Control request timeout: interrupt")
+    s = SDKSession(ClaudeAgentOptions(), client=Bad())
+    await s.start()
+    await s.interrupt()
+    assert s._interrupted
+
+
+def test_interrupt_timeout_default():
+    assert sdk_session_mod.INTERRUPT_TIMEOUT == 5

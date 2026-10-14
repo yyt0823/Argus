@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import datetime
 from typing import Any
@@ -23,8 +24,10 @@ from argus.tools.server import build_tool_server
 
 log = logging.getLogger(__name__)
 
-BUILTIN_TOOLS = ["WebSearch", "WebFetch"]
+# WebFetch is deliberately excluded: it can send arbitrary data (e.g. memory, chat history) to any URL.
+BUILTIN_TOOLS = ["WebSearch"]
 MAX_TURNS = 30
+INTERRUPT_TIMEOUT = 5  # seconds; the SDK's own control-request timeout is 60s
 _ABORTED = ("aborted_streaming", "aborted_tools")
 
 
@@ -59,8 +62,8 @@ class SDKSession:
     async def start(self) -> None:
         try:
             await self._client.connect()
-        except ClaudeSDKError as e:
-            raise SessionError(f"could not start Claude: {e}") from e
+        except Exception as e:  # the SDK raises plain Exception on e.g. initialize timeout
+            raise SessionError(f"could not start Claude: {e or type(e).__name__}") from e
         self._connected = True
 
     async def ask(self, text: str) -> str:
@@ -104,8 +107,10 @@ class SDKSession:
         if not self._connected or self._closed:
             return
         try:
-            await self._client.interrupt()
-        except ClaudeSDKError as e:
+            await asyncio.wait_for(self._client.interrupt(), timeout=INTERRUPT_TIMEOUT)
+        except asyncio.TimeoutError:
+            log.warning("interrupt timed out after %ss", INTERRUPT_TIMEOUT)
+        except Exception as e:  # noqa: BLE001 - the flag is set; ask() will still report Interrupted
             log.warning("interrupt failed: %s", e)
 
     async def close(self) -> None:
