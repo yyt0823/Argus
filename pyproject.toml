@@ -1,0 +1,13 @@
+[project]
+name = "argus"
+version = "0.1.0"
+description = "Personal AI assistant on Claude Agent SDK, reached via iMessage"
+requires-python = ">=3.11"
+dependencies = ["claude-agent-sdk"]
+
+[project.optional-dependencies]
+dev = ["pytest", "pytest-asyncio"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
