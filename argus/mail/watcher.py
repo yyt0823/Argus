@@ -1,5 +1,8 @@
 """Mail watcher: poll the inbox, triage new mail, store verdicts, alert, and brief daily.
 
+Every reader call and the ``pgrep`` check run in a worker thread (``asyncio.to_thread``) so mail
+I/O never blocks the event loop (iMessage polling, the stop word). Store calls stay on the loop.
+
 State keys (``Store.get_state``/``set_state``):
 
 - ``mail_last_id``: highest Mail message ROWID already processed (the checkpoint).
@@ -109,7 +112,7 @@ class MailWatcher:
         try:
             checkpoint = self._store.get_state(KEY_LAST_ID)
             if checkpoint is None:
-                self._baseline(now, today)
+                await self._baseline(now, today)
                 return
             touched = await self._process_new(int(checkpoint))
         except MailReaderError as e:
@@ -129,16 +132,17 @@ class MailWatcher:
 
     # --- steps ---
 
-    def _baseline(self, now: datetime, today: str) -> None:
+    async def _baseline(self, now: datetime, today: str) -> None:
         """First run: remember where the mailbox is now; never triage existing mail."""
-        self._store.set_state(KEY_LAST_ID, str(self._reader.max_id()))
+        self._store.set_state(KEY_LAST_ID, str(await asyncio.to_thread(self._reader.max_id)))
         if now.time() >= self._cfg.briefing_time:
             self._store.set_state(KEY_LAST_BRIEFING, today)
         log.info("mail watcher baseline set at message %s", self._store.get_state(KEY_LAST_ID))
 
     async def _process_new(self, checkpoint: int) -> list[int]:
         done: list[int] = []
-        for mail in self._reader.inbox_since(checkpoint, limit=self._batch_limit):
+        new = await asyncio.to_thread(self._reader.inbox_since, checkpoint, limit=self._batch_limit)
+        for mail in new:
             await self._triage_and_store(mail, attempts=1)
             # Advance only after the row is stored, so a crash never skips a message.
             self._store.set_state(KEY_LAST_ID, str(mail.id))
@@ -165,7 +169,7 @@ class MailWatcher:
 
     async def _triage_and_store(self, mail: MailSummary, attempts: int) -> None:
         try:
-            body = self._reader.read_body(mail.id, BODY_CHARS)
+            body = await asyncio.to_thread(self._reader.read_body, mail.id, BODY_CHARS)
         except MailReaderError:  # e.g. not downloaded yet
             body = mail.snippet or mail.subject
         row = {
@@ -212,7 +216,7 @@ class MailWatcher:
         if quiet or self._store.get_state(KEY_STALE_NOTIFIED) == today:
             return
         try:
-            running = self._mail_running()
+            running = await asyncio.to_thread(self._mail_running)
         except Exception:
             log.warning("cannot check whether Mail is running", exc_info=True)
             return

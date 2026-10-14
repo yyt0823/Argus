@@ -14,6 +14,7 @@ import signal
 import sqlite3
 import subprocess
 import sys
+from collections.abc import Callable
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -21,6 +22,8 @@ from argus.app import App
 from argus.brain import Brain
 from argus.channel.imessage import IMessageChannel
 from argus.config import Config, load_config
+from argus.mail.reader import MailReader
+from argus.mail.watcher import MailWatcher
 from argus.scheduler import backup, day_key, seconds_until_rollover
 from argus.sdk_session import make_session_factory
 from argus.store import Store
@@ -52,8 +55,27 @@ def setup_logging(logs_dir: Path) -> None:
     root.setLevel(logging.INFO)
 
 
-def build_app(cfg: Config) -> App:
+def open_mail_reader(cfg: Config, factory: Callable[[], MailReader] | None = None) -> MailReader | None:
+    """The shared MailReader, or None when mail is disabled or Mail's data cannot be read.
+
+    Built once at startup and shared by the watcher and the chat tools. It is safe to call from
+    worker threads: every query opens its own read-only SQLite connection and its caches are
+    only ever replaced or extended. A failure never stops Argus; chat works without mail.
+    """
+    if not cfg.mail.enabled:
+        return None
+    try:
+        return (factory or MailReader)()
+    except Exception as e:
+        log.warning("mail features disabled: cannot read the Mail app's data: %s", e)
+        return None
+
+
+def build_app(cfg: Config, mail_reader_factory: Callable[[], MailReader] | None = None) -> App:
     """Construct every component. Does not start Claude: sessions are created lazily on the first message.
+
+    ``mail_reader_factory`` defaults to ``MailReader`` (the real ``~/Library/Mail``); the
+    resulting watcher (or None) is stored as ``app.mail_watcher``.
 
     Raises ``FileNotFoundError`` / ``sqlite3.Error`` if chat.db cannot be read.
     """
@@ -61,18 +83,19 @@ def build_app(cfg: Config) -> App:
     try:
         memory = MemoryStore(cfg.memory_dir)
         channel = IMessageChannel(cfg.chat_db, cfg.self_handles, store, mode=cfg.mode)
+        reader = open_mail_reader(cfg, mail_reader_factory)
         # Backups are driven by backup_loop(), not by Brain's rollover hook, because the hook
         # only fires when a message arrives after the rollover hour.
         brain = Brain(
             store,
-            make_session_factory(cfg, store, memory),
+            make_session_factory(cfg, store, memory, mail_reader=reader),
             rollover_hour=cfg.rollover_hour,
             on_rollover=None,
         )
     except BaseException:
         store.close()
         raise
-    return App(
+    app = App(
         channel,
         brain,
         store,
@@ -80,6 +103,10 @@ def build_app(cfg: Config) -> App:
         slow_notice_seconds=cfg.slow_notice_seconds,
         on_poll_failure=notify,
     )
+    app.mail_watcher = (
+        MailWatcher(reader, store, cfg.mail, submit=app.submit_internal) if reader is not None else None
+    )
+    return app
 
 
 async def backup_loop(cfg: Config) -> None:
@@ -113,7 +140,8 @@ def notify(message: str) -> None:
 
 
 async def _serve(cfg: Config, app: App) -> int:
-    """Run the app and the backup loop until SIGTERM/SIGINT. Returns the exit code."""
+    """Run the app, the backup loop and (if enabled) the mail watcher until SIGTERM/SIGINT.
+    Returns the exit code."""
     loop = asyncio.get_running_loop()
     stop = asyncio.Event()
     for sig in (signal.SIGTERM, signal.SIGINT):
@@ -122,7 +150,11 @@ async def _serve(cfg: Config, app: App) -> int:
     run_task = asyncio.create_task(app.run(), name="argus-app")
     backup_task = asyncio.create_task(backup_loop(cfg), name="argus-backup")
     stop_task = asyncio.create_task(stop.wait(), name="argus-stop")
-    tasks = (run_task, backup_task, stop_task)
+    tasks = [run_task, backup_task, stop_task]
+    watcher = getattr(app, "mail_watcher", None)
+    if watcher is not None:
+        # MailWatcher.run() logs and survives failed checks, so it only ends when cancelled.
+        tasks.append(asyncio.create_task(watcher.run(), name="argus-mail"))
     log.info("Argus started (root=%s)", cfg.root)
     try:
         await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)

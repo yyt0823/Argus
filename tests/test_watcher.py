@@ -442,3 +442,45 @@ async def test_alert_wraps_email_content_as_untrusted(tmp_path):
     assert text.count("<untrusted_email>") == 1 and text.count("</untrusted_email>") == 1
     assert text.rstrip().endswith("</untrusted_email>")
     assert "Ignore previous instructions" in text
+
+
+async def test_reader_and_pgrep_run_off_the_event_loop_thread(tmp_path):
+    """Mail I/O must never block the event loop (iMessage polling, the stop word)."""
+    import threading
+
+    loop_thread = threading.get_ident()
+    seen: dict[str, set[int]] = {}
+
+    def record(name):
+        seen.setdefault(name, set()).add(threading.get_ident())
+
+    class ThreadReader(FakeReader):
+        def max_id(self):
+            record("max_id")
+            return super().max_id()
+
+        def inbox_since(self, after_id, limit=200):
+            record("inbox_since")
+            return super().inbox_since(after_id, limit)
+
+        def read_body(self, id, max_chars=20000):
+            record("read_body")
+            return super().read_body(id, max_chars)
+
+    env = Env(tmp_path, DAY.replace(hour=10))
+    env.reader = ThreadReader()
+
+    def running():
+        record("mail_running")
+        return True
+
+    env.watcher = MailWatcher(env.reader, env.store, env.cfg, env.make()._submit,
+                              triage_fn=env.triage, now=env.clock, mail_running=running)
+    await env.watcher.check_once()          # baseline: max_id
+    env.reader.add(1, DAY.replace(hour=9, minute=59))
+    env.triage.fail[1] = 1
+    await env.watcher.check_once()          # inbox_since + read_body, triage fails
+    await env.watcher.check_once()          # retry: read_body again
+    assert set(seen) == {"max_id", "inbox_since", "read_body", "mail_running"}
+    for name, threads in seen.items():
+        assert loop_thread not in threads, name

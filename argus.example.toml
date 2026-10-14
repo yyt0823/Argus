@@ -35,3 +35,13 @@ self_handles = ["+15550000000"]
 
 # Claude model to use; omit to use the Claude Code default.
 # model = "sonnet"
+
+# --- Email (optional; reads the macOS Mail app's local data, read-only) ---
+# All keys optional; defaults shown. Add your accounts to Mail first (see "Email" in the README).
+# [mail]
+# enabled = true                  # false: no mail tools, alerts or briefing
+# briefing_time = "08:00"         # daily email briefing (sent on start if missed today)
+# quiet_start = "23:00"           # no immediate alerts from quiet_start to quiet_end;
+# quiet_end = "08:00"             #   those emails go into the next briefing
+# check_interval_minutes = 5      # how often new mail is checked
+# triage_model = "haiku"          # model for the one-shot, tool-less importance check per email

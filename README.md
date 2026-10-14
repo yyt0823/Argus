@@ -72,6 +72,28 @@ Open the conversation with Argus's Apple ID (or, in `mode = "self"`, with yourse
 - Messages sent while Argus is busy are queued and answered in order. The queue is saved, so messages that were waiting when Argus restarted are answered after it comes back.
 - If Argus cannot read new messages for about a minute, it shows a macOS notification (once per outage).
 
+## Email
+
+Argus reads your email through the macOS **Mail** app's local data (read-only; it never sends, deletes, moves or flags mail, and stores no mail passwords):
+
+- every new inbox email gets a short, tool-less Claude check (default model `haiku`) that decides whether it is important;
+- important email triggers a short `🤖` alert within about 5 minutes, except during quiet hours (23:00–08:00);
+- every day at 08:00 Argus sends one briefing on the last 24 hours (sent on start if the Mac was off at 08:00);
+- you can ask about your email any time ("any emails about exams this week?").
+
+On the very first run Argus only records where your mailbox is; existing mail is never triaged or alerted.
+
+Setup:
+
+1. Open Mail → Settings → Accounts (or Mail → Add Account) and add each mailbox: **Google** for Gmail, **Microsoft Exchange** for Microsoft 365 / university accounts, **iCloud** for iCloud Mail (including custom-domain addresses). Sync **Mail** only; Mail handles each provider's login (SSO, MFA).
+2. Keep Mail running (add it to Login Items). Mail only downloads new messages while it is open; Argus sends one notice a day if it is not running.
+3. The same Full Disk Access that lets Argus read `chat.db` covers `~/Library/Mail`.
+4. Optionally tune the `[mail]` table in `argus.toml` (all keys optional, defaults shown in `argus.example.toml`): `enabled`, `briefing_time`, `quiet_start`, `quiet_end`, `check_interval_minutes`, `triage_model`. Set `enabled = false` to turn every mail feature off.
+
+If Mail's data cannot be read at startup, Argus logs a warning and runs without mail features.
+
+Privacy: message bodies are never copied into Argus's database; only the triage result (sender, subject, one-line summary, category, action, deadline) is stored in `data/argus.db` (table `mail_triage`). Bodies are read from Mail's files on demand. Email text sent to Claude for triage or chat stays within your Claude subscription, like your messages.
+
 ## Where data lives
 
 Everything personal stays on the Mac and is git-ignored:
@@ -79,7 +101,7 @@ Everything personal stays on the Mac and is git-ignored:
 | Path | Contents |
 |---|---|
 | `argus.toml` | Your config (your handles) |
-| `data/argus.db` | Message archive, daily sessions, internal state (SQLite) |
+| `data/argus.db` | Message archive, daily sessions, email triage results, internal state (SQLite) |
 | `memory/` | Argus's long-term memory (`MEMORY.md` index + one Markdown file per topic) |
 | `backups/YYYY-MM-DD/` | Daily snapshot of `data/argus.db` and `memory/`, taken at 04:00; newest 30 kept |
 | `logs/argus.log` | Application log, rotated daily, 30 days kept |
@@ -103,6 +125,7 @@ Argus's persona and rules are in `CLAUDE.md`.
 ## Security notes
 
 - Argus can search the web (WebSearch) but **cannot fetch arbitrary URLs: WebFetch is intentionally disabled**. A web page or search result could carry a prompt injection; without WebFetch, an injected instruction cannot make Argus send your memory or message history to an attacker-controlled URL.
+- Email is untrusted input (anyone can email you). Triage calls have no tools, mail tools wrap email content in `<untrusted_email>` markers, and Argus is told to report instructions found in email, never follow them. Mail access is read-only.
 - Automatic login (needed so the LaunchAgent starts after a reboot) is unavailable while FileVault is on; decide which you prefer for this machine.
 
 ## Stopping and starting

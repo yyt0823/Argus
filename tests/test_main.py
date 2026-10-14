@@ -6,8 +6,21 @@ import pytest
 import argus.main as main_mod
 from argus.app import App
 from argus.config import Config
+from argus.config import MailConfig
+from argus.mail.reader import MailReader, MailReaderError
+from argus.mail.watcher import MailWatcher
 from argus.main import backup_loop, build_app
 from argus.scheduler import day_key
+from tests.mail_fixtures import build_fake_mail
+
+
+@pytest.fixture(autouse=True)
+def no_real_mail(monkeypatch):
+    """Never open the real ~/Library/Mail from tests: the default reader always fails here."""
+    def refuse(*args, **kwargs):
+        raise MailReaderError("real Mail data is off-limits in tests")
+
+    monkeypatch.setattr(main_mod, "MailReader", refuse)
 
 
 def test_build_app_wires_everything(tmp_path, fake_chat_db):
@@ -165,3 +178,131 @@ def test_build_app_passes_mode_to_channel(tmp_path, fake_chat_db, mode):
         assert app.channel.mode == mode
     finally:
         app.store.close()
+
+
+# --- mail wiring ---
+
+
+def _record_session_factory(monkeypatch):
+    calls = []
+    real = main_mod.make_session_factory
+
+    def recording(cfg, store, memory, **kwargs):
+        calls.append(kwargs)
+        return real(cfg, store, memory, **kwargs)
+
+    monkeypatch.setattr(main_mod, "make_session_factory", recording)
+    return calls
+
+
+def test_build_app_wires_mail_reader_and_watcher(tmp_path, fake_chat_db, monkeypatch):
+    fm = build_fake_mail(tmp_path)
+    calls = _record_session_factory(monkeypatch)
+    cfg = Config(root=tmp_path, self_handles=("+15550000000",), chat_db=fake_chat_db.path)
+    app = build_app(cfg, mail_reader_factory=lambda: MailReader(fm.mail_dir, fm.accounts_db))
+    try:
+        reader = calls[0]["mail_reader"]
+        assert isinstance(reader, MailReader)
+        assert isinstance(app.mail_watcher, MailWatcher)
+        assert app.mail_watcher._reader is reader
+        assert app.mail_watcher._store is app.store
+        assert app.mail_watcher._cfg is cfg.mail
+        assert app.mail_watcher._submit == app.submit_internal
+    finally:
+        app.store.close()
+
+
+def test_build_app_without_mail_when_disabled(tmp_path, fake_chat_db, monkeypatch):
+    calls = _record_session_factory(monkeypatch)
+    built = []
+    cfg = Config(root=tmp_path, self_handles=("+15550000000",), chat_db=fake_chat_db.path,
+                 mail=MailConfig(enabled=False))
+    app = build_app(cfg, mail_reader_factory=lambda: built.append(1))
+    try:
+        assert built == []
+        assert app.mail_watcher is None
+        assert calls[0]["mail_reader"] is None
+    finally:
+        app.store.close()
+
+
+def test_build_app_survives_mail_reader_failure(tmp_path, fake_chat_db, monkeypatch, caplog):
+    calls = _record_session_factory(monkeypatch)
+    cfg = Config(root=tmp_path, self_handles=("+15550000000",), chat_db=fake_chat_db.path)
+    # Default factory: the autouse fixture makes MailReader raise MailReaderError.
+    app = build_app(cfg)
+    try:
+        assert isinstance(app, App)
+        assert app.mail_watcher is None
+        assert calls[0]["mail_reader"] is None
+        assert "mail" in caplog.text.lower()
+    finally:
+        app.store.close()
+
+
+def test_build_app_survives_unexpected_mail_reader_error(tmp_path, fake_chat_db):
+    cfg = Config(root=tmp_path, self_handles=("+15550000000",), chat_db=fake_chat_db.path)
+
+    def boom():
+        raise PermissionError("no access")
+
+    app = build_app(cfg, mail_reader_factory=boom)
+    try:
+        assert app.mail_watcher is None
+    finally:
+        app.store.close()
+
+
+class _FakeWatcher:
+    def __init__(self):
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+        self.cancelled = False
+
+    async def run(self):
+        self.started.set()
+        try:
+            await self.release.wait()
+        except asyncio.CancelledError:
+            self.cancelled = True
+            raise
+
+
+class _IdleApp:
+    def __init__(self, watcher):
+        self.mail_watcher = watcher
+
+    async def run(self):
+        await asyncio.Event().wait()
+
+
+async def test_serve_runs_and_cancels_mail_watcher(tmp_path, monkeypatch):
+    import os
+    import signal
+
+    async def idle_backup(cfg):
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(main_mod, "backup_loop", idle_backup)
+    cfg = Config(root=tmp_path, self_handles=("+15550000000",), chat_db=tmp_path / "chat.db")
+    watcher = _FakeWatcher()
+    serve = asyncio.create_task(main_mod._serve(cfg, _IdleApp(watcher)))
+    await asyncio.wait_for(watcher.started.wait(), 5)
+    os.kill(os.getpid(), signal.SIGTERM)
+    assert await asyncio.wait_for(serve, 5) == 0
+    assert watcher.cancelled
+
+
+async def test_serve_without_mail_watcher(tmp_path, monkeypatch):
+    import os
+    import signal
+
+    async def idle_backup(cfg):
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(main_mod, "backup_loop", idle_backup)
+    cfg = Config(root=tmp_path, self_handles=("+15550000000",), chat_db=tmp_path / "chat.db")
+    serve = asyncio.create_task(main_mod._serve(cfg, _IdleApp(None)))
+    await asyncio.sleep(0.05)
+    os.kill(os.getpid(), signal.SIGTERM)
+    assert await asyncio.wait_for(serve, 5) == 0
