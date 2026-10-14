@@ -112,6 +112,23 @@ async def test_factory_builds_options(tmp_path: Path):
     assert "WebFetch" not in o.allowed_tools and "WebSearch" in o.allowed_tools
     assert o.permission_mode == "dontAsk" and o.setting_sources == [] and o.strict_mcp_config
     assert set(o.mcp_servers) == {"argus"} and o.max_turns == 30
+    assert not any("mail_" in n for n in o.allowed_tools)
+    store.close()
+
+async def test_factory_passes_mail_reader(tmp_path: Path):
+    from argus.mail.reader import MailReader
+    from tests.mail_fixtures import build_fake_mail
+    cfg = Config(root=tmp_path, self_handles=("+15550000000",), model="sonnet")
+    cfg.data_dir.mkdir()
+    store, memory = Store(cfg.db_path), MemoryStore(cfg.memory_dir)
+    fm = build_fake_mail(tmp_path)
+    reader = MailReader(fm.mail_dir, fm.accounts_db)
+    made = []
+    def client_cls(options):
+        made.append(FakeClient(options=options)); return made[-1]
+    await make_session_factory(cfg, store, memory, mail_reader=reader, client_cls=client_cls)(None)
+    allowed = made[0].options.allowed_tools
+    assert {"mcp__argus__mail_recent", "mcp__argus__mail_search", "mcp__argus__mail_read"} <= set(allowed)
     store.close()
 
 

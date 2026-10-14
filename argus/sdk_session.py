@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from datetime import datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from claude_agent_sdk import (
     AssistantMessage,
@@ -21,6 +21,9 @@ from argus.session import Interrupted, SessionError, SessionFactory
 from argus.store import Store
 from argus.tools.memory import MemoryStore
 from argus.tools.server import build_tool_server
+
+if TYPE_CHECKING:
+    from argus.mail.reader import MailReader
 
 log = logging.getLogger(__name__)
 
@@ -126,9 +129,13 @@ class SDKSession:
 
 
 def build_options(
-    cfg: Config, store: Store, memory: MemoryStore, resume_id: str | None
+    cfg: Config,
+    store: Store,
+    memory: MemoryStore,
+    resume_id: str | None,
+    mail_reader: MailReader | None = None,
 ) -> ClaudeAgentOptions:
-    server, allowed = build_tool_server(store, memory, cfg.db_path)
+    server, allowed = build_tool_server(store, memory, cfg.db_path, mail_reader)
     persona_path = cfg.root / "CLAUDE.md"
     persona = persona_path.read_text(encoding="utf-8") if persona_path.is_file() else ""
     return ClaudeAgentOptions(
@@ -147,12 +154,16 @@ def build_options(
 
 
 def make_session_factory(
-    cfg: Config, store: Store, memory: MemoryStore, client_cls: Any = ClaudeSDKClient
+    cfg: Config,
+    store: Store,
+    memory: MemoryStore,
+    mail_reader: MailReader | None = None,
+    client_cls: Any = ClaudeSDKClient,
 ) -> SessionFactory:
     """Return ``factory(resume_id)`` that builds options and returns a started ``SDKSession``."""
 
     async def factory(resume_id: str | None) -> SDKSession:
-        options = build_options(cfg, store, memory, resume_id)
+        options = build_options(cfg, store, memory, resume_id, mail_reader)
         session = SDKSession(options, client=client_cls(options=options))
         await session.start()
         return session

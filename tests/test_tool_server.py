@@ -80,3 +80,27 @@ async def test_query_data_does_not_block_event_loop(env):
     assert r.get("is_error") is not True, r
     assert elapsed > 0.3
     assert ticks >= 3
+
+async def test_mail_tools_added_only_with_reader(tmp_path):
+    from argus.mail.reader import MailReader
+    from tests.mail_fixtures import build_fake_mail
+    store = Store(tmp_path / "a.db")
+    mem = MemoryStore(tmp_path / "m")
+    base = {"memory_list", "memory_read", "memory_write", "memory_delete", "query_data", "search_history"}
+    assert {t.name for t in build_tools(store, mem, tmp_path / "a.db")} == base
+    fm = build_fake_mail(tmp_path)
+    reader = MailReader(fm.mail_dir, fm.accounts_db)
+    names = {t.name for t in build_tools(store, mem, tmp_path / "a.db", mail_reader=reader)}
+    assert names == base | {"mail_recent", "mail_search", "mail_read"}
+    _, allowed = build_tool_server(store, mem, tmp_path / "a.db", mail_reader=reader)
+    assert {"mcp__argus__mail_recent", "mcp__argus__mail_search", "mcp__argus__mail_read"} <= set(allowed)
+    assert len(allowed) == 9
+    store.close()
+
+def test_query_data_describes_mail_triage(env):
+    _, _, t = env
+    d = t["query_data"].description
+    assert "mail_triage(" in d
+    for col in ("mail_id", "account", "received_at", "important", "category", "summary", "action",
+                "deadline", "status", "attempts", "alerted_at", "briefed_at"):
+        assert col in d
