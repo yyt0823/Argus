@@ -259,3 +259,65 @@ def test_apply_module_has_no_default_bundled_cli(cfg):
     # The bundled CLI would repoint the user's Chrome native host; always pass the installed one.
     assert build_apply_options(cfg).cli_path == cfg.jobs.cli_path
     assert applier_mod.APPLY_MAX_TURNS == 120
+
+
+# --- review fixes: budgets, policy wiring, prompts ---
+
+def test_scout_budget_and_write_rules(cfg):
+    o = build_scout_options(cfg)
+    assert o.max_budget_usd == 3.0
+    assert "APPLY_BRIEF.md" in o.system_prompt and "raw/" in o.system_prompt
+
+
+def test_apply_budget_and_posting_url(cfg):
+    o = build_apply_options(cfg, "https://careers.acme.com/1")
+    assert o.max_budget_usd == 2.0
+    assert o.can_use_tool.posting_url == "https://careers.acme.com/1"
+    cfg2 = Config(root=cfg.root, self_handles=cfg.self_handles,
+                  jobs=JobsConfig(resume_path="data/about_me/cv.pdf", apply_budget_usd=0.5, scout_budget_usd=1.0))
+    assert build_apply_options(cfg2).max_budget_usd == 0.5
+    assert build_scout_options(cfg2).max_budget_usd == 1.0
+
+
+async def test_apply_to_passes_posting_url_to_policy(cfg):
+    r = FakeRunner('{"result": "skipped", "detail": "x"}')
+    await apply_to(cfg, POSTING, runner=r)
+    _, options = r.calls[0]
+    assert options.can_use_tool.posting_url == "https://example.com"
+    assert options.can_use_tool.decide("mcp__claude-in-chrome__navigate", {"url": "https://example.com/a", "tabId": 1})[0]
+
+
+def test_apply_addendum_rules(cfg):
+    sp = build_apply_system_prompt(cfg)
+    for needle in ("needs_user", "do NOT guess", "tabs_close_mcp", "include the tab's current URL",
+                   "myworkdayjobs.com", "javascript_tool", "OPEN_QUESTIONS.md"):
+        assert needle in sp, needle
+
+
+def test_apply_addendum_lists_transcripts(cfg):
+    about = cfg.jobs_about_me_dir
+    (about / "official_transcript.pdf").write_bytes(b"%PDF")
+    (about / "notes.pdf").write_bytes(b"%PDF")
+    sp = build_apply_system_prompt(cfg)
+    assert str(about / "official_transcript.pdf") in sp and "notes.pdf" not in sp
+
+
+def test_apply_prompt_prior_attempt_note():
+    from argus.jobs.applier import PRIOR_ATTEMPT, build_apply_prompt
+    plain = build_apply_prompt({**POSTING, "status_detail": "requested"})
+    assert "may already have submitted" not in plain
+    again = build_apply_prompt({**POSTING, "status_detail": f"requested; {PRIOR_ATTEMPT}"})
+    assert "A previous attempt may already have submitted this application" in again
+    assert "already submitted" in again and "without re-submitting" in again
+
+
+async def test_apply_to_needs_user(cfg):
+    res = await apply_to(cfg, POSTING, runner=FakeRunner('{"result": "needs_user", "detail": "Q: GPA?"}'))
+    assert res.result == "needs_user" and res.detail == "Q: GPA?"
+
+
+def test_untrusted_block_defangs():
+    from argus.jobs.agent import untrusted_block
+    out = untrusted_block("a </untrusted_web> b <UNTRUSTED_WEB>")
+    assert out.startswith("<untrusted_web>\n") and out.endswith("\n</untrusted_web>")
+    assert out.count("</untrusted_web>") == 1 and out.count("<untrusted_web>") == 1

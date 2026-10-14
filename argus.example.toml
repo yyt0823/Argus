@@ -68,7 +68,7 @@ self_handles = ["+15550000000"]
 # [jobs]
 # enabled = true                     # false: no searches, applications, tools or briefing section
 # scout_time = "07:30"               # daily search (run on start if missed today)
-# auto_apply = true                  # false: only search and report; apply only when you ask
+# auto_apply = false                 # true: apply automatically to fit >= min_fit_apply on known ATS sites
 # min_fit_apply = 4                  # auto-apply to postings with fit >= this (1-5)
 # daily_apply_limit = 8              # max automatic submissions per day
 # apply_window = ["08:30", "22:00"]  # only apply between these times

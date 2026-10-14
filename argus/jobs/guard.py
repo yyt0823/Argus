@@ -8,15 +8,28 @@ consulted for calls that would prompt), so the builders install both.
 
 Paths are resolved with ``Path.resolve()`` (``..`` and symlinks followed) relative to the
 agent's cwd, the internships directory. Name checks are case-insensitive because macOS
-file systems are.
+file systems are. Malformed input (NUL bytes, wrong types) is denied, never raised.
+
+Scout: Read text files under about_me (not SENSITIVE*, documents/, binaries); Write/Edit only
+``INTERNSHIPS.md``, ``seen_companies.txt`` and files under ``raw/`` in the internships dir.
+
+Apply: Read only the brief and profile files (``APPLY_READABLE``), the résumé and transcript
+PDFs (``*transcript*.pdf`` directly in about_me); upload only the résumé and those PDFs;
+Write/Edit only under ``internships/applications/``; Chrome tools from ``CHROME_ALLOWED`` only.
+``navigate`` may only go to the posting's site or a known ATS (``ATS_DOMAINS``), and
+``javascript_tool`` only runs in a tab whose last ``navigate`` (tracked per tabId from tool
+inputs) went to such a host. The policy cannot see where clicks lead, so this is a best-effort
+fence around the user's logged-in browser, not a sandbox.
 """
 
 from __future__ import annotations
 
+import fnmatch
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
+from urllib.parse import urlsplit
 
 from claude_agent_sdk import PermissionResultAllow, PermissionResultDeny
 
@@ -24,8 +37,45 @@ Mode = Literal["scout", "apply"]
 MODES = ("scout", "apply")
 
 CHROME_PREFIX = "mcp__claude-in-chrome__"
-CHROME_FORBIDDEN = {"select_browser", "switch_browser", "upload_image"}
+CHROME_ALLOWED = {
+    "tabs_context_mcp", "tabs_create_mcp", "tabs_close_mcp", "navigate", "computer", "find",
+    "read_page", "get_page_text", "form_input", "file_upload", "browser_batch",
+    "list_connected_browsers",
+}
 CHROME_UPLOAD = "file_upload"
+CHROME_NAVIGATE = "navigate"
+CHROME_JS = "javascript_tool"
+CHROME_BATCH = "browser_batch"
+
+# Applicant tracking systems the applier may navigate to (and run JS on), with their subdomains.
+ATS_DOMAINS = (
+    "myworkdayjobs.com", "myworkdaysite.com", "greenhouse.io", "lever.co", "ashbyhq.com", "icims.com",
+    "smartrecruiters.com", "avature.net", "successfactors.com", "taleo.net", "oraclecloud.com",
+    "jobvite.com", "workable.com",
+)
+# The scout's ``ats`` label -> the host family it implies.
+ATS_FAMILIES = {
+    "workday": ("myworkdayjobs.com", "myworkdaysite.com"),
+    "greenhouse": ("greenhouse.io",),
+    "lever": ("lever.co",),
+    "ashby": ("ashbyhq.com",),
+    "icims": ("icims.com",),
+    "smartrecruiters": ("smartrecruiters.com",),
+    "avature": ("avature.net",),
+    "successfactors": ("successfactors.com",),
+    "taleo": ("taleo.net",),
+    "oracle": ("oraclecloud.com",),
+    "jobvite": ("jobvite.com",),
+    "workable": ("workable.com",),
+}
+# Second-level labels under which the registrable domain has three labels (example.co.uk).
+_SHORT_SLDS = {"co", "com", "ac", "gov", "org", "net", "edu", "gc", "qc", "on"}
+
+APPLY_READABLE_INTERNSHIPS = {"apply_brief.md"}
+APPLY_READABLE_ABOUT_ME = {"profile.md", "education.md", "work_and_projects.md", "open_questions.md"}
+TRANSCRIPT_GLOB = "*transcript*.pdf"
+SCOUT_WRITABLE = {"internships.md", "seen_companies.txt"}
+SCOUT_WRITABLE_DIR = "raw"
 
 SENSITIVE_MARKER = "sensitive"  # any path component starting with this (any case) is off limits
 DOCUMENTS_DIR = "documents"  # scans of IDs, passports, etc. directly under about_me
@@ -42,24 +92,74 @@ def _within(path: Path, root: Path) -> bool:
     return path == root or path.is_relative_to(root)
 
 
+def url_host(url: object) -> str | None:
+    """Lower-case host of an http(s) URL (scheme optional, defaulting to https), else None."""
+    if not isinstance(url, str) or not url.strip() or "\x00" in url or any(c.isspace() for c in url.strip()):
+        return None
+    url = url.strip()
+    if "://" not in url:
+        if ":" in url.split("/", 1)[0] and not url.split("/", 1)[0].rsplit(":", 1)[-1].isdigit():
+            return None  # javascript:, data:, mailto: ...
+        url = "https://" + url
+    try:
+        parts = urlsplit(url)
+        host = parts.hostname
+    except ValueError:
+        return None
+    if parts.scheme.lower() not in ("http", "https") or not host:
+        return None
+    return host.rstrip(".").lower() or None
+
+
+def registrable_domain(host: str) -> str:
+    """Approximate registrable domain (no public-suffix list): ``a.b.example.com`` -> ``example.com``."""
+    labels = host.split(".")
+    if len(labels) >= 3 and len(labels[-1]) == 2 and labels[-2] in _SHORT_SLDS:
+        return ".".join(labels[-3:])
+    return ".".join(labels[-2:])
+
+
+def _host_in(host: str, domains) -> bool:
+    return any(host == d or host.endswith("." + d) for d in domains)
+
+
+def is_ats_host(host: str | None) -> bool:
+    return bool(host) and _host_in(host, ATS_DOMAINS)
+
+
+def auto_apply_eligible(posting: dict) -> bool:
+    """True if the posting's URL is on a known ATS (or on the host family its ``ats`` names)."""
+    host = url_host(posting.get("url"))
+    if host is None:
+        return False
+    if is_ats_host(host):
+        return True
+    family = ATS_FAMILIES.get(str(posting.get("ats") or "").strip().casefold())
+    return bool(family) and _host_in(host, family)
+
+
 @dataclass(frozen=True)
 class GuardPolicy:
     about_me_dir: Path
     internships_dir: Path
     resume_path: Path
     mode: Mode
+    posting_url: str | None = None
+    # tabId -> host of the last allowed ``navigate`` in that tab (None: unknown). Mutable state
+    # inside a frozen dataclass: the policy instance belongs to one agent run.
+    tab_hosts: dict = field(default_factory=dict, compare=False, repr=False)
 
     # --- path helpers ---
 
     def _resolve(self, raw: object) -> Path | None:
-        if not isinstance(raw, str) or not raw.strip():
+        if not isinstance(raw, str) or not raw.strip() or "\x00" in raw:
             return None
-        p = Path(raw.strip()).expanduser()
-        if not p.is_absolute():
-            p = self.internships_dir / p
         try:
+            p = Path(raw.strip()).expanduser()
+            if not p.is_absolute():
+                p = self.internships_dir / p
             return p.resolve()
-        except (OSError, RuntimeError):  # symlink loops etc.
+        except (OSError, RuntimeError, ValueError):  # symlink loops, bad ~user, etc.
             return None
 
     def _blocked(self, raw: object, path: Path) -> str | None:
@@ -85,11 +185,25 @@ class GuardPolicy:
             return False, reason
         if path == self.resume_path:
             return True, "the résumé is readable"
+        if self.mode == "apply":
+            if self._is_transcript(path):
+                return True, "transcript PDF"
+            name = path.name.casefold()
+            if path.parent == self.internships_dir and name in APPLY_READABLE_INTERNSHIPS:
+                return True, "the apply brief"
+            if path.parent == self.about_me_dir and name in APPLY_READABLE_ABOUT_ME:
+                return True, "profile file"
+            return False, ("the applier may only read APPLY_BRIEF.md, PROFILE.md, EDUCATION.md, "
+                           "WORK_AND_PROJECTS.md, OPEN_QUESTIONS.md, the résumé and transcript PDFs")
         if not _within(path, self.about_me_dir):
             return False, f"only files under {self.about_me_dir} may be read"
         if path.suffix.casefold() in BINARY_SUFFIXES:
             return False, "binary, image and PDF files may not be read"
         return True, "text file under about_me"
+
+    def _is_transcript(self, path: Path) -> bool:
+        """A ``*transcript*.pdf`` directly in about_me (resolved path: symlinks already followed)."""
+        return path.parent == self.about_me_dir and fnmatch.fnmatch(path.name.casefold(), TRANSCRIPT_GLOB)
 
     def _tree_escapes(self, root: Path) -> bool:
         """True if a directory tree contains a symlink pointing at a blocked or outside file."""
@@ -118,10 +232,18 @@ class GuardPolicy:
         reason = self._blocked(raw, path)
         if reason:
             return False, reason
-        root = self.internships_dir / "applications" if self.mode == "apply" else self.internships_dir
-        if path == root or not path.is_relative_to(root):
-            return False, f"{self.mode} may only write files under {root}"
-        return True, f"write under {root}"
+        if self.mode == "apply":
+            root = self.internships_dir / "applications"
+            if path == root or not path.is_relative_to(root):
+                return False, f"apply may only write files under {root}"
+            return True, f"write under {root}"
+        if path.is_relative_to(self.internships_dir) and path != self.internships_dir:
+            rel = [p.casefold() for p in path.relative_to(self.internships_dir).parts]
+            if len(rel) == 1 and rel[0] in SCOUT_WRITABLE:
+                return True, "tracker file"
+            if len(rel) >= 2 and rel[0] == SCOUT_WRITABLE_DIR:
+                return True, "raw notes"
+        return False, "the scout may only write INTERNSHIPS.md, seen_companies.txt and files under raw/"
 
     def _glob(self, input: dict) -> tuple[bool, str]:
         pattern = input.get("pattern")
@@ -168,14 +290,77 @@ class GuardPolicy:
             reason = self._blocked(raw, path)
             if reason:
                 return False, reason
-            if path == self.resume_path:
+            if path == self.resume_path or self._is_transcript(path):
                 continue
-            if not (_within(path, self.about_me_dir) and path.suffix.casefold() == ".pdf"):
-                return False, f"only the résumé or PDFs in about_me (transcripts) may be uploaded, not {raw}"
+            return False, f"only the résumé or *transcript*.pdf files in about_me may be uploaded, not {raw}"
         return True, "upload of résumé / transcript PDFs"
 
+    # --- Chrome (apply mode) ---
+
+    def _nav_allowed(self, host: str | None) -> bool:
+        if not host:
+            return False
+        if is_ats_host(host):
+            return True
+        posting = url_host(self.posting_url)
+        if posting is None:
+            return False
+        return host == posting or _host_in(host, (registrable_domain(posting),))
+
+    def _chrome(self, short: str, input: dict, tabs: dict) -> tuple[bool, str]:
+        """Decide one Chrome call; ``tabs`` (tabId -> host) is updated for allowed navigations."""
+        if short == CHROME_UPLOAD:
+            return self._upload(input)
+        if short == CHROME_NAVIGATE:
+            url = input.get("url")
+            tab = input.get("tabId")
+            if isinstance(url, str) and url.strip().casefold() in ("back", "forward"):
+                tabs[tab] = None  # destination unknown: no JavaScript there until the next navigate
+                return True, "history navigation"
+            host = url_host(url)
+            if not self._nav_allowed(host):
+                return False, f"navigate only to the posting's site or a known ATS, not {url!r}"
+            tabs[tab] = host
+            return True, f"navigate to {host}"
+        if short == CHROME_JS:
+            tab = input.get("tabId")
+            host = tabs.get(tab) if isinstance(tab, (int, float)) and not isinstance(tab, bool) else None
+            if not self._nav_allowed(host):
+                return False, ("javascript_tool only runs in a tab you navigated (navigate with this "
+                               "tabId) to the posting's site or a known ATS")
+            return True, f"JavaScript on {host}"
+        if short == CHROME_BATCH:
+            actions = input.get("actions")
+            if not isinstance(actions, list) or not actions:
+                return False, "browser_batch needs a non-empty 'actions' list"
+            for item in actions:
+                if not isinstance(item, dict) or not isinstance(item.get("name"), str) \
+                        or not isinstance(item.get("input"), dict):
+                    return False, "browser_batch items must be {name, input}"
+                inner = item["name"].removeprefix(CHROME_PREFIX)
+                if inner == CHROME_BATCH:
+                    return False, "browser_batch cannot be nested"
+                if inner not in CHROME_ALLOWED and inner != CHROME_JS:
+                    return False, f"browser_batch item {inner} is not allowed"
+                allowed, reason = self._chrome(inner, item["input"], tabs)
+                if not allowed:
+                    return False, f"browser_batch item {inner}: {reason}"
+            return True, "browser_batch of allowed actions"
+        if short in CHROME_ALLOWED:
+            return True, "Chrome tool"
+        return False, f"{short} is not allowed for the applier"
+
     def decide(self, tool_name: str, input: dict[str, Any]) -> tuple[bool, str]:
-        """Pure decision: ``(allowed, reason)`` for one tool call."""
+        """``(allowed, reason)`` for one tool call; never raises (errors deny). Pure except that
+        allowed Chrome navigations update ``tab_hosts``."""
+        try:
+            return self._decide(tool_name, input)
+        except Exception as e:  # noqa: BLE001 - a policy bug must deny, not crash the run
+            return False, f"invalid tool input ({type(e).__name__})"
+
+    def _decide(self, tool_name: str, input: dict[str, Any]) -> tuple[bool, str]:
+        if not isinstance(tool_name, str):
+            return False, "invalid tool name"
         if not isinstance(input, dict):
             input = {}
         if tool_name == "ToolSearch":
@@ -195,11 +380,12 @@ class GuardPolicy:
             if self.mode != "apply":
                 return False, "Chrome tools are only available to the applier"
             short = tool_name[len(CHROME_PREFIX):]
-            if short in CHROME_FORBIDDEN:
-                return False, f"{short} is not allowed (never pick or switch browsers; no screenshot uploads)"
-            if short == CHROME_UPLOAD:
-                return self._upload(input)
-            return True, "Chrome tool"
+            tabs = dict(self.tab_hosts)
+            allowed, reason = self._chrome(short, input, tabs)
+            if allowed:  # commit navigations only when the whole call (or batch) is allowed
+                self.tab_hosts.clear()
+                self.tab_hosts.update(tabs)
+            return allowed, reason
         return False, f"{tool_name} is not available to the jobs {self.mode} agent"
 
     # --- SDK adapters ---
@@ -224,8 +410,11 @@ class GuardPolicy:
         }
 
 
-def make_policy(about_me_dir: Path, internships_dir: Path, resume_path: Path, mode: Mode) -> GuardPolicy:
-    """Build the tool policy; directories and the résumé path are resolved once here."""
+def make_policy(
+    about_me_dir: Path, internships_dir: Path, resume_path: Path, mode: Mode, posting_url: str | None = None,
+) -> GuardPolicy:
+    """Build the tool policy; directories and the résumé path are resolved once here.
+    ``posting_url`` (apply mode) is the one site besides known ATSs the applier may navigate to."""
     if mode not in MODES:
         raise ValueError(f"mode must be 'scout' or 'apply', got {mode!r}")
     return GuardPolicy(
@@ -233,4 +422,5 @@ def make_policy(about_me_dir: Path, internships_dir: Path, resume_path: Path, mo
         internships_dir=Path(internships_dir).expanduser().resolve(),
         resume_path=Path(resume_path).expanduser().resolve(),
         mode=mode,
+        posting_url=posting_url,
     )

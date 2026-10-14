@@ -381,7 +381,7 @@ def test_build_app_without_fitness_dir_does_not_import(tmp_path, fake_chat_db, m
     assert called == []
 
 
-def test_build_app_passes_fitness_flag_to_watcher(tmp_path, fake_chat_db):
+def test_build_app_passes_fitness_flag_to_briefing(tmp_path, fake_chat_db):
     from argus.config import FitnessConfig
     fm = build_fake_mail(tmp_path)
     for enabled in (True, False):
@@ -389,7 +389,7 @@ def test_build_app_passes_fitness_flag_to_watcher(tmp_path, fake_chat_db):
                      fitness=FitnessConfig(enabled=enabled))
         app = build_app(cfg, mail_reader_factory=lambda: MailReader(fm.mail_dir, fm.accounts_db))
         try:
-            assert app.mail_watcher._fitness is enabled
+            assert app.briefing._fitness is enabled
         finally:
             app.store.close()
 
@@ -433,7 +433,7 @@ def test_build_app_briefing_includes_jobs_when_enabled(tmp_path, fake_chat_db):
                      jobs=JobsConfig(enabled=enabled))
         app = build_app(cfg, mail_reader_factory=lambda: MailReader(fm.mail_dir, fm.accounts_db))
         try:
-            assert app.mail_watcher._jobs is enabled
+            assert app.briefing._jobs is enabled
         finally:
             app.store.close()
 
@@ -511,3 +511,15 @@ def test_launchd_exit_timeout_covers_shutdown_grace(tmp_path):
         subprocess.run(["plutil", "-lint", str(rendered)], check=True, capture_output=True)
     data = plistlib.loads(rendered.read_bytes())
     assert data["ExitTimeOut"] >= 60 and data["ExitTimeOut"] >= SHUTDOWN_GRACE + 10
+
+
+def test_build_app_creates_briefing_without_mail(tmp_path, fake_chat_db):
+    from argus.config import MailConfig
+    cfg = Config(root=tmp_path, self_handles=("+15550000000",), chat_db=fake_chat_db.path,
+                 mail=MailConfig(enabled=False))
+    app = build_app(cfg)
+    try:
+        assert app.mail_watcher is None
+        assert app.briefing.enabled  # fitness/jobs sections still need a daily briefing
+    finally:
+        app.store.close()

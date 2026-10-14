@@ -32,6 +32,7 @@ from argus.channel.base import Channel, IncomingMessage
 from argus.config import Config, FitnessConfig, JobsConfig, MailConfig
 from argus.fitness.nutrition import day_status
 from argus.mail.reader import MailReader
+from argus.briefing import BriefingScheduler
 from argus.mail.watcher import MailWatcher
 from argus.scheduler import day_key
 from argus.sdk_session import make_session_factory
@@ -224,7 +225,7 @@ def build_world(root: Path) -> World:
     brain = Brain(store, factory, rollover_hour=cfg.rollover_hour)
     channel = FakeChannel()
     app = App(channel, brain, store, poll_interval=0.05, slow_notice_seconds=cfg.slow_notice_seconds)
-    watcher = MailWatcher(reader, store, cfg.mail, submit=app.submit_internal, fitness=True, jobs=True)
+    watcher = MailWatcher(reader, store, cfg.mail, submit=app.submit_internal)
     return World(cfg, store, memory, channel, jobs, app, watcher)
 
 
@@ -345,7 +346,7 @@ async def test_live_conversation(tmp_path: Path):
 
         # 9. internal briefing (the watcher's real text)
         writes_before = len(w.memory.writes)
-        briefing = w.watcher._briefing_text(datetime.now())
+        briefing = BriefingScheduler(w.cfg, w.store, submit=w.app.submit_internal, mail_enabled=True, fitness=True, jobs=True, mail_available=True).text(datetime.now())
         r, _ = await turn("9 briefing", briefing, internal=True)
         check("internal task" not in r.lower() and "内部任务" not in r, "9 briefing", "mentions internal task")
         check(any(k in r for k in ("COMP 512", "COMP512", "Smith", "Oct 20", "10月20", "10 月 20", "10/20", "期中")),

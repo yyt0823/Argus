@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
@@ -105,3 +106,17 @@ def opt_str(value: Any) -> str | None:
         return None
     s = str(value).strip()
     return s or None
+
+
+UNTRUSTED_TAG = "untrusted_web"
+_TAG_RE = re.compile(r"<(/?)untrusted_web", re.IGNORECASE)
+
+
+def defang(text: str) -> str:
+    """Neutralise ``<untrusted_web`` / ``</untrusted_web`` inside web-derived text."""
+    return _TAG_RE.sub(r"[\1untrusted_web", text)
+
+
+def untrusted_block(text: str) -> str:
+    """``text`` (web-derived) inside an ``<untrusted_web>`` block it cannot close early."""
+    return f"<{UNTRUSTED_TAG}>\n{defang(text)}\n</{UNTRUSTED_TAG}>"

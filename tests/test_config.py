@@ -152,7 +152,8 @@ def test_jobs_defaults(tmp_path: Path):
     cfg = load_config(tmp_path)
     j = cfg.jobs
     assert j == JobsConfig()
-    assert j.enabled is True and j.auto_apply is True
+    assert j.enabled is True and j.auto_apply is False  # opt-in
+    assert j.scout_budget_usd == 3.0 and j.apply_budget_usd == 2.0
     assert j.scout_time == time(7, 30)
     assert j.min_fit_apply == 4 and j.daily_apply_limit == 8
     assert j.apply_window == (time(8, 30), time(22, 0))
@@ -164,16 +165,22 @@ def test_jobs_defaults(tmp_path: Path):
 def test_jobs_table_parsed(tmp_path: Path):
     _write(tmp_path, '[jobs]\nenabled = false\nscout_time = "06:05"\nauto_apply = false\nmin_fit_apply = 5\n'
                      'daily_apply_limit = 0\napply_window = ["09:00", "21:30"]\n'
-                     'internships_dir = "x/intern"\nresume_path = "/abs/cv.pdf"\ncli_path = "/usr/local/bin/claude"\n')
+                     'internships_dir = "x/intern"\nresume_path = "/abs/cv.pdf"\ncli_path = "/usr/local/bin/claude"\n'
+                     'scout_budget_usd = 5\napply_budget_usd = 1.5\n')
     cfg = load_config(tmp_path)
     assert cfg.jobs == JobsConfig(
         enabled=False, scout_time=time(6, 5), auto_apply=False, min_fit_apply=5, daily_apply_limit=0,
         apply_window=(time(9, 0), time(21, 30)), internships_dir="x/intern", resume_path="/abs/cv.pdf",
-        cli_path="/usr/local/bin/claude",
+        cli_path="/usr/local/bin/claude", scout_budget_usd=5.0, apply_budget_usd=1.5,
     )
+    assert isinstance(cfg.jobs.scout_budget_usd, float)
     assert cfg.jobs_internships_dir == tmp_path / "x" / "intern"
     assert cfg.jobs_resume_path == Path("/abs/cv.pdf")
     assert cfg.jobs_about_me_dir == tmp_path / "x"
+
+def test_jobs_auto_apply_enabled_explicitly(tmp_path: Path):
+    _write(tmp_path, '[jobs]\nauto_apply = true\n')
+    assert load_config(tmp_path).jobs.auto_apply is True
 
 def test_jobs_in_apply_window():
     j = JobsConfig()
@@ -199,6 +206,12 @@ def test_jobs_in_apply_window():
     '[jobs]\ninternships_dir = ""\n',
     '[jobs]\nresume_path = 3\n',
     '[jobs]\ncli_path = "  "\n',
+    '[jobs]\nscout_budget_usd = 0\n',
+    '[jobs]\nscout_budget_usd = -1\n',
+    '[jobs]\napply_budget_usd = "2"\n',
+    '[jobs]\napply_budget_usd = true\n',
+    '[jobs]\napply_budget_usd = inf\n',
+    '[jobs]\napply_budget_usd = nan\n',
 ])
 def test_jobs_invalid(tmp_path: Path, extra):
     _write(tmp_path, extra)

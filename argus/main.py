@@ -25,6 +25,7 @@ from argus.config import Config, load_config
 from argus.fitness.importer import import_markdown_logs
 from argus.jobs.scheduler import JobScheduler
 from argus.mail.reader import MailReader
+from argus.briefing import BriefingScheduler
 from argus.mail.watcher import MailWatcher
 from argus.scheduler import backup, day_key, seconds_until_rollover
 from argus.sdk_session import make_session_factory
@@ -134,9 +135,19 @@ def build_app(cfg: Config, mail_reader_factory: Callable[[], MailReader] | None 
     if scheduler is not None:
         scheduler.submit = app.submit_internal  # the App exists only now
     app.job_scheduler = scheduler
+    app.briefing = BriefingScheduler(
+        cfg,
+        store,
+        submit=app.submit_internal,
+        mail_enabled=cfg.mail.enabled,
+        fitness=cfg.fitness.enabled,
+        jobs=scheduler is not None,
+        scout_running=(lambda: scheduler.scouting) if scheduler is not None else (lambda: False),
+        mail_available=reader is not None,
+    )
     app.mail_watcher = (
-        MailWatcher(reader, store, cfg.mail, submit=app.submit_internal, fitness=cfg.fitness.enabled,
-                    jobs=scheduler is not None)
+        MailWatcher(reader, store, cfg.mail, submit=app.submit_internal,
+                    briefing_pending=app.briefing.pending)
         if reader is not None
         else None
     )
@@ -190,6 +201,10 @@ async def _serve(cfg: Config, app: App) -> int:
     if watcher is not None:
         # MailWatcher.run() logs and survives failed checks, so it only ends when cancelled.
         tasks.append(asyncio.create_task(watcher.run(), name="argus-mail"))
+    briefing = getattr(app, "briefing", None)
+    if briefing is not None and briefing.enabled:
+        # BriefingScheduler.run() runs even when mail is unavailable.
+        tasks.append(asyncio.create_task(briefing.run(), name="argus-briefing"))
     scheduler = getattr(app, "job_scheduler", None)
     if scheduler is not None:
         # JobScheduler.run() logs and survives failed ticks; cancelling it also cancels a running

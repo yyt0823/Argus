@@ -60,9 +60,11 @@ class JobsConfig:
 
     enabled: bool = True
     scout_time: time = time(7, 30)
-    auto_apply: bool = True
+    auto_apply: bool = False  # opt in from argus.toml
     min_fit_apply: int = 4  # on the tracker's 1-5 scale
-    daily_apply_limit: int = 8
+    daily_apply_limit: int = 8  # automatic submissions per day; automatic runs are capped at twice this
+    scout_budget_usd: float = 3.0  # max_budget_usd of one scout run
+    apply_budget_usd: float = 2.0  # max_budget_usd of one application run
     apply_window: tuple[time, time] = (time(8, 30), time(22, 0))
     internships_dir: str = "data/about_me/internships"
     resume_path: str = "data/about_me/yantian_yin_cv.pdf"
@@ -269,8 +271,10 @@ def _load_fitness(raw: object, path: Path) -> FitnessConfig:
 
 _JOBS_BOOL_KEYS = ("enabled", "auto_apply")
 _JOBS_PATH_KEYS = ("internships_dir", "resume_path", "cli_path")
+_JOBS_BUDGET_KEYS = ("scout_budget_usd", "apply_budget_usd")
 _JOBS_KEYS = (
-    *_JOBS_BOOL_KEYS, *_JOBS_PATH_KEYS, "scout_time", "min_fit_apply", "daily_apply_limit", "apply_window",
+    *_JOBS_BOOL_KEYS, *_JOBS_PATH_KEYS, *_JOBS_BUDGET_KEYS, "scout_time", "min_fit_apply", "daily_apply_limit",
+    "apply_window",
 )
 
 
@@ -314,6 +318,12 @@ def _load_jobs(raw: object, path: Path) -> JobsConfig:
         if isinstance(value, bool) or not isinstance(value, int) or value < 0:
             raise ValueError(f"{path}: jobs.daily_apply_limit must be a non-negative integer, got {value!r}")
         kwargs["daily_apply_limit"] = value
+    for key in _JOBS_BUDGET_KEYS:
+        if key in raw:
+            value = raw[key]
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0 < value < float("inf"):
+                raise ValueError(f"{path}: jobs.{key} must be a positive number (USD), got {value!r}")
+            kwargs[key] = float(value)
     if "apply_window" in raw:
         value = raw["apply_window"]
         times = [_hhmm(v) for v in value] if isinstance(value, list) and len(value) == 2 else None
