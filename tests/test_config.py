@@ -19,3 +19,17 @@ def test_load_config_requires_handles(tmp_path: Path):
     (tmp_path / "argus.toml").write_text("self_handles = []\n")
     with pytest.raises(ValueError, match="self_handles"):
         load_config(tmp_path)
+
+def test_load_config_mode_defaults_to_self(tmp_path: Path):
+    (tmp_path / "argus.toml").write_text('self_handles = ["+15550000000"]\n')
+    assert load_config(tmp_path).mode == "self"
+
+def test_load_config_reads_contact_mode(tmp_path: Path):
+    (tmp_path / "argus.toml").write_text('mode = "contact"\nself_handles = ["+15550000000"]\n')
+    assert load_config(tmp_path).mode == "contact"
+
+@pytest.mark.parametrize("bad", ['"bot"', '""', "1"])
+def test_load_config_rejects_bad_mode(tmp_path: Path, bad):
+    (tmp_path / "argus.toml").write_text(f'mode = {bad}\nself_handles = ["+15550000000"]\n')
+    with pytest.raises(ValueError, match="mode"):
+        load_config(tmp_path)

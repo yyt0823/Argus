@@ -1,8 +1,18 @@
 # Argus configuration.
 # Copy this file to argus.toml (git-ignored) and fill in your own handles.
 
-# Required: your own iMessage handles (phone number in E.164 form and/or Apple ID email).
-# Argus answers messages you send to yourself in the self-chat with these handles.
+# Which Apple ID the Mac's Messages app is signed into.
+#   "contact" (recommended): a dedicated Apple ID for Argus. You text the bot from your iPhone
+#             and Argus replies in that conversation. See "Dedicated Apple ID" in the README.
+#   "self"    (default): your own Apple ID. You text yourself; Argus answers in the self-chat.
+#             Every message appears twice on the iPhone (sent + received copy).
+mode = "contact"
+
+# Required: iMessage handles (phone number in E.164 form and/or Apple ID email).
+#   mode = "contact": YOUR handles, i.e. what your iPhone sends from when you text the bot
+#                     (list both if your iPhone may send from either). Argus only talks to these.
+#                     Replies go to whichever of them wrote last.
+#   mode = "self":    your own handles; Argus answers messages you send to yourself.
 self_handles = ["+15550000000"]
 # self_handles = ["+15550000000", "someone@example.com"]
 

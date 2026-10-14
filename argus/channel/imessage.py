@@ -24,6 +24,8 @@ SEND_SCRIPT = (
 )
 
 CHECKPOINT_KEY = "imessage_last_rowid"
+REPLY_CHAT_KEY = "imessage_reply_chat"  # contact mode: chat guid of the owner handle that last wrote
+MODES = ("self", "contact")
 SEND_ATTEMPTS = 3
 CAPTURE_TRIES = 12
 CAPTURE_INTERVAL = 0.25
@@ -70,6 +72,15 @@ def _default_runner(args: list[str]) -> subprocess.CompletedProcess:
 
 
 class IMessageChannel(Channel):
+    """Two modes, depending on which Apple ID the Mac's Messages app is signed into.
+
+    - ``self``: the user's own Apple ID; the user texts themselves. Every message shows up twice
+      (a sent row and an echo row), which are paired and delivered once.
+    - ``contact``: a dedicated bot Apple ID; the owner texts the bot. ``self_handles`` are the
+      owner's handles. The owner's messages are ``is_from_me = 0`` rows (one each); Argus's own
+      replies are ``is_from_me = 1`` rows and are ignored.
+    """
+
     def __init__(
         self,
         chat_db: Path,
@@ -80,7 +91,11 @@ class IMessageChannel(Channel):
         sleep: Callable[[float], None] = time.sleep,
         pair_window_seconds: float = 10.0,
         clock: Callable[[], float] = time.monotonic,
+        mode: str = "self",
     ) -> None:
+        if mode not in MODES:
+            raise ValueError(f"mode must be one of {MODES}, got {mode!r}")
+        self.mode = mode
         if not self_handles:
             raise ValueError("self_handles must not be empty")
         self._chat_db = Path(chat_db)
@@ -101,7 +116,7 @@ class IMessageChannel(Channel):
         with closing(self._connect()) as c:
             c.execute("SELECT max(ROWID) FROM message").fetchone()
         raw = self._store.get_state(CHECKPOINT_KEY)
-        if raw is not None:
+        if raw is not None and self.mode == "self":
             self._rebuild_recent(int(raw))
 
     def _connect(self) -> sqlite3.Connection:
@@ -215,6 +230,8 @@ class IMessageChannel(Channel):
             self._store.set_state(CHECKPOINT_KEY, str(self._max_rowid()))
             return []
         checkpoint = int(raw)
+        if self.mode == "contact":
+            return self._poll_contact(checkpoint)
         rows = self._fetch_after(checkpoint)
         accepted: list[IncomingMessage] = []
         max_rowid = checkpoint
@@ -236,6 +253,50 @@ class IMessageChannel(Channel):
             self._store.accept_messages(accepted, CHECKPOINT_KEY, str(max_rowid))
         return accepted
 
+    def _fetch_contact_rows(self, rowid: int) -> list[tuple]:
+        """Contact mode: (ROWID, guid, text, attributedBody, is_from_me, date, chat guid) of every
+        row after ``rowid`` in the owner chats. Our own sends are included so the checkpoint can
+        move past them; the caller skips them."""
+        placeholders = ",".join("?" for _ in self.chat_guids)
+        sql = (
+            "SELECT m.ROWID, m.guid, m.text, m.attributedBody, m.is_from_me, m.date, c.guid "
+            "FROM message m JOIN chat_message_join j ON j.message_id = m.ROWID "
+            "JOIN chat c ON c.ROWID = j.chat_id "
+            f"WHERE c.guid IN ({placeholders}) AND m.ROWID > ? "
+            "AND m.item_type = 0 AND m.associated_message_type = 0 "
+            "ORDER BY m.ROWID"
+        )
+        with closing(self._connect()) as c:
+            return c.execute(sql, (*self.chat_guids, rowid)).fetchall()
+
+    def _poll_contact(self, checkpoint: int) -> list[IncomingMessage]:
+        rows = self._fetch_contact_rows(checkpoint)
+        accepted: list[IncomingMessage] = []
+        max_rowid = checkpoint
+        reply_chat: str | None = None
+        for rowid, guid, text, blob, is_from_me, date, chat_guid in rows:
+            max_rowid = max(max_rowid, rowid)
+            if is_from_me:
+                continue  # Argus's own reply
+            body = self._body(text, blob)
+            if not body or body.startswith("🤖"):
+                continue
+            accepted.append(IncomingMessage(id=guid, text=body, received_at=apple_ns_to_local(date or 0)))
+            reply_chat = chat_guid
+        if max_rowid != checkpoint:
+            self._store.accept_messages(accepted, CHECKPOINT_KEY, str(max_rowid))
+        if reply_chat is not None:
+            self._store.set_state(REPLY_CHAT_KEY, reply_chat)
+        return accepted
+
+    def _reply_chat(self) -> str:
+        """The chat to send to: in contact mode, the owner chat that most recently wrote."""
+        if self.mode == "contact":
+            saved = self._store.get_state(REPLY_CHAT_KEY)
+            if saved in self.chat_guids:
+                return saved
+        return self.chat_guids[0]
+
     # --- sending ---
 
     def send(self, text: str) -> None:
@@ -246,12 +307,13 @@ class IMessageChannel(Channel):
             log.error("circuit breaker: %d+ replies in %ds; refusing to send", RATE_LIMIT, int(RATE_WINDOW))
             raise SendError("rate limit: too many replies")
         self._sent.append((now, full))
-        try:
-            before: int | None = self._max_rowid()
-        except sqlite3.Error:
-            log.warning("could not read chat.db before send; skipping guid capture", exc_info=True)
-            before = None
-        args = ["osascript", "-e", SEND_SCRIPT, full, self.chat_guids[0]]
+        before: int | None = None
+        if self.mode == "self":  # contact mode ignores is_from_me rows, so no capture is needed
+            try:
+                before = self._max_rowid()
+            except sqlite3.Error:
+                log.warning("could not read chat.db before send; skipping guid capture", exc_info=True)
+        args = ["osascript", "-e", SEND_SCRIPT, full, self._reply_chat()]
         reason = "unknown error"
         for attempt in range(1, SEND_ATTEMPTS + 1):
             try:

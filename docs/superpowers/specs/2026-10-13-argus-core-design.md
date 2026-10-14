@@ -46,6 +46,7 @@ Each sub-project goes through its own design → spec → implementation plan �
 | Session granularity | One session per day, rolling over at 4:00 AM | Coherent within a day; cross-day continuity comes from memory |
 | Storage | Text memory → Markdown; structured data and conversation archive → SQLite | Markdown is easy for the user to read and edit; SQLite supports aggregation and date-range queries |
 | Retrieval | SQL for structured data; SQLite FTS5 full-text search for past conversations | Date-based questions need exact results, which SQL gives more reliably than vector retrieval |
+| Channel (revised 2026-10-13) | iMessage with a **dedicated Apple ID** for Argus (`mode = "contact"`): the Mac's Messages app is signed into the bot account and the user texts it from the iPhone; `mode = "self"` remains supported | The self-chat shows every message twice on the iPhone; as a separate contact, each message appears once and inbound/outbound rows are told apart by `is_from_me` |
 
 ## 3. Architecture
 

@@ -155,3 +155,13 @@ def test_build_app_wires_poll_failure_notification(tmp_path, fake_chat_db):
         assert app.on_poll_failure is main_mod.notify
     finally:
         app.store.close()
+
+
+@pytest.mark.parametrize("mode", ["self", "contact"])
+def test_build_app_passes_mode_to_channel(tmp_path, fake_chat_db, mode):
+    cfg = Config(root=tmp_path, self_handles=("+15550000000",), chat_db=fake_chat_db.path, mode=mode)
+    app = build_app(cfg)
+    try:
+        assert app.channel.mode == mode
+    finally:
+        app.store.close()

@@ -60,7 +60,7 @@ def build_app(cfg: Config) -> App:
     store = Store(cfg.db_path)
     try:
         memory = MemoryStore(cfg.memory_dir)
-        channel = IMessageChannel(cfg.chat_db, cfg.self_handles, store)
+        channel = IMessageChannel(cfg.chat_db, cfg.self_handles, store, mode=cfg.mode)
         # Backups are driven by backup_loop(), not by Brain's rollover hook, because the hook
         # only fires when a message arrives after the rollover hour.
         brain = Brain(

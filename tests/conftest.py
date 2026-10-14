@@ -19,6 +19,13 @@ class FakeChatDB:
         c.commit(); c.close()
         self.n = 0
 
+    def add_chat(self, guid):
+        """Add a chat with an arbitrary guid; return its chat_id for ``add``."""
+        c = sqlite3.connect(self.path)
+        cur = c.execute("INSERT INTO chat (guid) VALUES (?)", (guid,))
+        c.commit(); c.close()
+        return cur.lastrowid
+
     def add(self, text, is_from_me, at, chat_id=1, as_blob=False, item_type=0):
         self.n += 1
         ns = int((at.astimezone(timezone.utc) - APPLE_EPOCH).total_seconds() * 1e9)

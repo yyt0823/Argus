@@ -10,13 +10,17 @@ from pathlib import Path
 @dataclass(frozen=True)
 class Config:
     root: Path
-    self_handles: tuple[str, ...]  # the user's own iMessage handles (phone numbers / emails)
+    # "self": Messages is signed into the user's own Apple ID; self_handles are the user's handles.
+    # "contact": Messages is signed into a dedicated bot Apple ID; self_handles are the owner's
+    # handles (the iPhone's phone number / email) that Argus talks to.
+    self_handles: tuple[str, ...]
     chat_db: Path = Path.home() / "Library/Messages/chat.db"
     poll_interval: float = 1.0
     rollover_hour: int = 4
     slow_notice_seconds: float = 15.0
     backup_keep: int = 30
     model: str | None = None
+    mode: str = "self"
 
     @property
     def data_dir(self) -> Path:
@@ -39,6 +43,8 @@ class Config:
         return self.root / "logs"
 
 
+MODES = ("self", "contact")
+
 _OPTIONAL_KEYS = ("poll_interval", "rollover_hour", "slow_notice_seconds", "backup_keep", "model")
 
 
@@ -58,7 +64,12 @@ def load_config(root: Path) -> Config:
     ):
         raise ValueError(f"{path}: self_handles must be a non-empty list of iMessage handles")
 
+    mode = raw.get("mode", "self")
+    if mode not in MODES:
+        raise ValueError(f"{path}: mode must be one of {', '.join(repr(m) for m in MODES)}, got {mode!r}")
+
     kwargs: dict = {k: raw[k] for k in _OPTIONAL_KEYS if k in raw}
+    kwargs["mode"] = mode
     if "chat_db" in raw:
         kwargs["chat_db"] = Path(raw["chat_db"]).expanduser()
     return Config(root=root, self_handles=tuple(h.strip() for h in handles), **kwargs)

@@ -10,7 +10,7 @@ Argus keeps:
 
 ## Requirements
 
-- macOS with Messages signed in to iMessage, using the same Apple ID as your iPhone.
+- macOS with Messages signed in to iMessage: preferably with a dedicated Apple ID for Argus (see [Dedicated Apple ID](#dedicated-apple-id-recommended)), or with the same Apple ID as your iPhone (`mode = "self"`).
 - Python 3.11+ (developed on 3.14, e.g. `brew install python@3.14`).
 - Claude Code logged in to your Claude subscription. No `ANTHROPIC_API_KEY` is needed or used.
 
@@ -24,6 +24,18 @@ $EDITOR argus.toml    # set self_handles to your own phone number / Apple ID ema
 ```
 
 `setup.sh` is safe to re-run. It never runs `sudo`; it prints the commands you need to run yourself.
+
+### Dedicated Apple ID (recommended)
+
+By default (`mode = "self"`) you text yourself, and the iPhone shows every message twice. With a dedicated Apple ID, Argus becomes an ordinary contact instead:
+
+1. Create a new Apple ID for Argus (any email address you control).
+2. On the Mac, sign Messages into it: Messages → Settings → iMessage, sign out of your own Apple ID, sign in with the new one.
+3. In `argus.toml`, set `mode = "contact"` and put your iPhone's handle(s) in `self_handles` (the phone number and/or email your iPhone sends iMessages from).
+4. Restart Argus: `launchctl kickstart -k gui/$(id -u)/com.argus.agent`.
+5. From your iPhone, send a message to the bot's Apple ID email. Argus answers in that conversation.
+
+Note: the Mac no longer shows your own iMessages, since its Messages app now belongs to the bot.
 
 ### Permissions (important)
 
@@ -52,7 +64,7 @@ Also enable automatic login (System Settings → Users & Groups), so the LaunchA
 
 ## Talking to Argus
 
-Open the conversation with yourself in Messages on your iPhone and type normally. Argus replies in the same chat, prefixed with `🤖 `.
+Open the conversation with Argus's Apple ID (or, in `mode = "self"`, with yourself) in Messages on your iPhone and type normally. Argus replies in the same chat, prefixed with `🤖 `.
 
 - If a reply takes more than 15 seconds, Argus first sends `🤖 收到，正在处理…`.
 - Send `停` to stop the task Argus is working on.
