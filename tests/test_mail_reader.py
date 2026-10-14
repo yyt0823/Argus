@@ -260,3 +260,60 @@ def test_read_body_finds_file_written_after_first_scan(fm, boxes):
 
 def test_mail_not_found_is_reader_error():
     assert issubclass(MailNotFound, MailReaderError)
+
+
+# --- robustness: one bad email must never raise beyond MailReaderError ---
+
+
+def _raw_mail(ctype: str, body: bytes, extra: str = "") -> bytes:
+    return (
+        b"From: Eve <eve@example.com>\r\nTo: me@example.com\r\nSubject: Poison\r\n"
+        b"Date: Sat, 10 Oct 2026 09:00:00 +0000\r\nMIME-Version: 1.0\r\n"
+        + extra.encode()
+        + f"Content-Type: {ctype}\r\nContent-Transfer-Encoding: 8bit\r\n\r\n".encode()
+        + body
+    )
+
+
+def _poisoned(fm, boxes, raw: bytes) -> int:
+    mid = add(fm, boxes["inbox"], "Poison", write_file=False)
+    fm.write_emlx(f"imap://{ICLOUD}/INBOX", mid, raw)
+    return mid
+
+
+@pytest.mark.parametrize("charset", ["x-no-such-charset", "utf-8\x00junk", "iso-2022-jp-ext", "éé"])
+def test_read_body_unknown_or_invalid_charset_decodes_as_utf8(fm, boxes, charset):
+    raw = _raw_mail(f'text/plain; charset="{charset}"', "Pay by Friday — thanks \xff".encode("utf-8") + b"\xfe")
+    mid = _poisoned(fm, boxes, raw)
+    out = reader(fm).read_body(mid)
+    assert "Pay by Friday" in out
+    assert "Subject: Poison" in out
+
+
+def test_read_body_invalid_charset_in_html_part(fm, boxes):
+    raw = _raw_mail('text/html; charset="bogus-cs"', b"<p>Hello <b>there</b></p>\xff")
+    out = reader(fm).read_body(_poisoned(fm, boxes, raw))
+    assert "Hello there" in out
+
+
+def test_read_body_garbage_mime_never_raises_unexpected(fm, boxes):
+    raw = _raw_mail('multipart/mixed; boundary="', b"--\r\n\xff\xfe garbage \x00\r\n--")
+    mid = _poisoned(fm, boxes, raw)
+    try:
+        out = reader(fm).read_body(mid)
+    except MailReaderError:
+        return
+    assert isinstance(out, str)
+
+
+def test_read_body_decoder_crash_becomes_reader_error(fm, boxes, monkeypatch):
+    import argus.mail.reader as rd
+
+    mid = add(fm, boxes["inbox"], body="fine")
+
+    def boom(msg):
+        raise RuntimeError("decoder exploded")
+
+    monkeypatch.setattr(rd, "_body_text", boom)
+    with pytest.raises(MailReaderError):
+        reader(fm).read_body(mid)

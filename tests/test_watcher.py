@@ -82,6 +82,9 @@ class Env:
         self.reader = FakeReader(mails)
         self.triage = FakeTriage()
         self.sent: list[str] = []
+        self.results: list[bool] = []    # outcomes for the next on_result calls (default True)
+        self.pending: list = []          # on_result callbacks held back when ``hold`` is set
+        self.hold = False
         self.clock = Clock(at)
         self.running = running
         self.cfg = MailConfig()
@@ -89,13 +92,16 @@ class Env:
         self.watcher = self.make()
 
     def make(self):
-        async def submit(text):
+        async def submit(text, on_result=None):
             self.sent.append(text)
+            if on_result is None:
+                return
+            if self.hold:
+                self.pending.append(on_result)
+            else:
+                on_result(self.results.pop(0) if self.results else True)
         return MailWatcher(self.reader, self.store, self.cfg, submit, triage_fn=self.triage,
                            now=self.clock, mail_running=lambda: self.running, **self.kw)
-
-    def briefings(self):
-        return [t for t in self.sent if "daily email briefing" in t]
 
     def alerts(self):
         return [t for t in self.sent if "important email" in t]
@@ -115,20 +121,8 @@ async def test_first_run_only_sets_checkpoint(tmp_path):
     assert env.store.get_state("mail_last_id") == "2500"
     assert env.triage.calls == []
     assert env.sent == []
-    # After briefing time on first run: today's briefing counts as done.
-    assert env.store.get_state("mail_last_briefing") == "2026-10-14"
     await env.watcher.check_once()
     assert env.triage.calls == [] and env.sent == []
-
-
-async def test_first_run_before_briefing_time_leaves_briefing_due(tmp_path):
-    env = Env(tmp_path, DAY.replace(hour=7))
-    env.reader.add(1, DAY.replace(hour=6))
-    await env.watcher.check_once()
-    assert env.store.get_state("mail_last_briefing") is None
-    env.clock.at = DAY.replace(hour=8)
-    await env.watcher.check_once()
-    assert len(env.briefings()) == 1
 
 
 async def test_new_mail_triaged_and_stored(tmp_path):
@@ -163,51 +157,18 @@ async def test_important_mail_one_combined_alert(tmp_path):
     assert len(env.sent) == 1
 
 
-async def test_quiet_hours_no_alert_then_briefing_at_eight(tmp_path):
+async def test_quiet_hours_no_alert_and_no_briefing_from_watcher(tmp_path):
     env = Env(tmp_path, DAY.replace(hour=7, minute=0))
     await baseline(env)
     env.clock.at = DAY.replace(hour=7, minute=59)
     env.reader.add(1, DAY.replace(hour=7, minute=58))
-    env.reader.add(2, DAY.replace(hour=7, minute=58))
     env.triage.important = {1}
     await env.watcher.check_once()
     assert env.sent == []
     assert env.store.get_triage(1)["alerted_at"] is None
     env.clock.at = DAY.replace(hour=8, minute=0)
     await env.watcher.check_once()
-    assert len(env.sent) == 1 and len(env.briefings()) == 1
-    assert env.sent[0].startswith(INTERNAL_PREFIX)
-    assert env.store.get_state("mail_last_briefing") == "2026-10-14"
-    for i in (1, 2):
-        row = env.store.get_triage(i)
-        assert row["briefed_at"] is not None
-    assert env.store.get_triage(1)["alerted_at"] is not None  # covered by the briefing
-    env.clock.at = DAY.replace(hour=8, minute=5)
-    await env.watcher.check_once()
-    assert len(env.sent) == 1
-
-
-async def test_new_important_mail_at_briefing_time_goes_into_briefing_only(tmp_path):
-    env = Env(tmp_path, DAY.replace(hour=7))
-    await baseline(env)
-    env.clock.at = DAY.replace(hour=8, minute=1)
-    env.reader.add(1, DAY.replace(hour=8))
-    env.triage.important = {1}
-    await env.watcher.check_once()
-    assert len(env.sent) == 1 and len(env.briefings()) == 1
-    assert env.store.get_triage(1)["alerted_at"] is not None
-
-
-async def test_catch_up_briefing_at_ten_once(tmp_path):
-    env = Env(tmp_path, DAY - timedelta(hours=2))  # first run yesterday 22:00
-    await baseline(env)
-    env.store.set_state("mail_last_briefing", "2026-10-13")
-    env.clock.at = DAY.replace(hour=10)
-    env.watcher = env.make()  # Argus restarted
-    await env.watcher.check_once()
-    assert len(env.briefings()) == 1
-    await env.watcher.check_once()
-    assert len(env.briefings()) == 1
+    assert env.sent == []  # quiet-hours mail is left to the daily briefing (argus.briefing)
 
 
 async def test_old_mail_triaged_not_alerted(tmp_path):
@@ -486,55 +447,203 @@ async def test_reader_and_pgrep_run_off_the_event_loop_thread(tmp_path):
         assert loop_thread not in threads, name
 
 
-# --- fitness additions to the daily briefing ---
+# --- H2: one bad email never stalls processing ---
 
-async def _briefing(tmp_path, **kw):
-    env = Env(tmp_path, DAY.replace(hour=7), **kw)
+async def test_unexpected_read_body_error_falls_back_to_snippet(tmp_path):
+    env = Env(tmp_path, DAY.replace(hour=10))
     await baseline(env)
-    return env
+    env.reader.add(1, DAY.replace(hour=9, minute=59), subject="Subj", snippet="the snippet")
+    env.reader.add(2, DAY.replace(hour=9, minute=59), subject="Only subject", snippet="")
 
+    def broken(id, max_chars=20000):
+        raise ValueError("embedded null character")
 
-async def test_briefing_without_fitness_mentions_no_fitness_tools(tmp_path):
-    env = await _briefing(tmp_path)
-    env.clock.at = DAY.replace(hour=8)
+    env.reader.read_body = broken
     await env.watcher.check_once()
-    (b,) = env.briefings()
-    assert "nutrition_status" not in b and "weigh" not in b.lower()
+    assert [c[1] for c in env.triage.calls] == ["the snippet", "Only subject"]
+    assert env.store.get_triage(1)["status"] == "triaged"
+    assert env.store.get_state("mail_last_id") == "2"
 
 
-async def test_briefing_with_fitness_asks_for_yesterday_and_weigh_in(tmp_path):
-    env = await _briefing(tmp_path, fitness=True)
-    env.clock.at = DAY.replace(hour=8)
+async def test_poisoned_charset_email_with_real_reader(tmp_path):
+    from argus.mail.reader import MailReader
+    from tests.mail_fixtures import build_fake_mail
+
+    fm = build_fake_mail(tmp_path)
+    box = fm.add_mailbox("imap://AAAA-1/INBOX")
+    env = Env(tmp_path, DAY.replace(hour=10))
+    env.reader = MailReader(fm.mail_dir, fm.accounts_db)
+    env.watcher = env.make()
+    await baseline(env)
+    bad = fm.add_message(box, "eve@example.com", "Eve", "Poison", DAY.replace(hour=9), write_file=False)
+    raw = (b"From: Eve <eve@example.com>\r\nSubject: Poison\r\nMIME-Version: 1.0\r\n"
+           b'Content-Type: text/plain; charset="utf-8\x00junk"\r\n\r\nPay the fee by Friday\xff\r\n')
+    fm.write_emlx("imap://AAAA-1/INBOX", bad, raw)
+    good = fm.add_message(box, "bob@example.com", "Bob", "Fine", DAY.replace(hour=9, minute=1), body="ok")
     await env.watcher.check_once()
-    (b,) = env.briefings()
-    assert "nutrition_status" in b and "2026-10-13" in b
-    assert "weigh" in b.lower() and "No weight has been logged" in b
+    assert [c[0] for c in env.triage.calls] == [bad, good]
+    assert "Pay the fee by Friday" in env.triage.calls[0][1]
+    assert env.store.get_state("mail_last_id") == str(good)
 
 
-async def test_briefing_with_fitness_no_weigh_in_reminder_when_recent_weight(tmp_path):
-    env = await _briefing(tmp_path, fitness=True)
-    env.store.add_weight(DAY.date() - timedelta(days=1), DAY - timedelta(hours=12), 72.0)
-    env.clock.at = DAY.replace(hour=8)
+async def test_message_that_keeps_failing_is_stored_failed_after_three_cycles(tmp_path):
+    env = Env(tmp_path, DAY.replace(hour=10))
+    await baseline(env)
+    env.reader.add(1, DAY.replace(hour=9, minute=58))
+    env.reader.add(2, DAY.replace(hour=9, minute=59))
+    real = env.store.upsert_triage
+
+    def picky(row):
+        if row["mail_id"] == 1 and row["status"] == "triaged":
+            raise ValueError("cannot store this one")
+        real(row)
+
+    env.store.upsert_triage = picky
+    for cycle in (1, 2):
+        await env.watcher.check_once()
+        assert env.store.get_state("mail_last_id") == "0", cycle
+        assert env.store.get_triage(2) is None
     await env.watcher.check_once()
-    (b,) = env.briefings()
-    assert "nutrition_status" in b and "No weight has been logged" not in b
-
-
-# --- jobs additions to the daily briefing ---
-
-async def test_briefing_without_jobs_mentions_no_jobs_tools(tmp_path):
-    env = await _briefing(tmp_path)
-    env.clock.at = DAY.replace(hour=8)
+    row = env.store.get_triage(1)
+    assert row["status"] == "failed" and row["attempts"] == 3  # never retried
+    assert env.store.get_triage(2)["status"] == "triaged"
+    assert env.store.get_state("mail_last_id") == "2"
+    calls = len(env.triage.calls)
     await env.watcher.check_once()
-    (b,) = env.briefings()
-    assert "jobs_list" not in b
+    assert len(env.triage.calls) == calls
 
 
-async def test_briefing_with_jobs_asks_for_postings_and_applications(tmp_path):
-    env = await _briefing(tmp_path, jobs=True)
-    env.clock.at = DAY.replace(hour=8)
+async def test_store_failure_that_recovers_resets_the_count(tmp_path):
+    env = Env(tmp_path, DAY.replace(hour=10))
+    await baseline(env)
+    env.reader.add(1, DAY.replace(hour=9, minute=58))
+    real = env.store.upsert_triage
+    fails = {"left": 2}
+
+    def flaky(row):
+        if fails["left"]:
+            fails["left"] -= 1
+            raise RuntimeError("db busy")
+        real(row)
+
+    env.store.upsert_triage = flaky
     await env.watcher.check_once()
-    (b,) = env.briefings()
-    assert "jobs_list" in b and "fit" in b.lower()
-    for status in ("submitted", "needs_login", "needs_attestation"):
-        assert status in b
+    await env.watcher.check_once()
+    await env.watcher.check_once()
+    row = env.store.get_triage(1)
+    assert row["status"] == "triaged" and row["attempts"] == 1
+    assert env.watcher._stuck == {}
+
+
+async def test_unstorable_message_still_moves_the_checkpoint(tmp_path):
+    env = Env(tmp_path, DAY.replace(hour=10))
+    await baseline(env)
+    env.reader.add(1, DAY.replace(hour=9, minute=58))
+
+    def broken(row):
+        raise RuntimeError("disk full")
+
+    env.store.upsert_triage = broken
+    for _ in range(3):
+        await env.watcher.check_once()
+    assert env.store.get_state("mail_last_id") == "1"
+
+
+async def test_read_failing_state_set_and_cleared(tmp_path):
+    env = Env(tmp_path, DAY.replace(hour=10))
+    await baseline(env)
+    assert not env.store.get_state("mail_read_failing")
+    env.reader.error = MailReaderError("nope")
+    await env.watcher.check_once()
+    assert env.store.get_state("mail_read_failing")
+    env.reader.error = None
+    await env.watcher.check_once()
+    assert env.store.get_state("mail_read_failing") == ""
+
+
+# --- alerts are marked only after the reply was sent ---
+
+async def _important(env, ids=(1,)):
+    await baseline(env)
+    for i in ids:
+        env.reader.add(i, DAY.replace(hour=9, minute=50 + i), subject=f"Subj {i}")
+    env.triage.important = set(ids)
+
+
+async def test_alert_marked_only_after_on_result_true(tmp_path):
+    env = Env(tmp_path, DAY.replace(hour=10))
+    await _important(env)
+    env.hold = True
+    await env.watcher.check_once()
+    assert len(env.alerts()) == 1
+    assert env.store.get_triage(1)["alerted_at"] is None
+    await env.watcher.check_once()       # in flight: not sent again
+    assert len(env.alerts()) == 1
+    env.pending.pop()(True)
+    assert env.store.get_triage(1)["alerted_at"] is not None
+
+
+async def test_failed_alert_retried_once_then_dropped(tmp_path):
+    env = Env(tmp_path, DAY.replace(hour=10))
+    await _important(env)
+    env.results = [False, False]
+    await env.watcher.check_once()
+    assert len(env.alerts()) == 1 and env.store.get_triage(1)["alerted_at"] is None
+    await env.watcher.check_once()
+    assert len(env.alerts()) == 2 and env.store.get_triage(1)["alerted_at"] is None
+    for _ in range(3):
+        await env.watcher.check_once()
+    assert len(env.alerts()) == 2  # no infinite loop
+
+
+async def test_failed_alert_retry_succeeds(tmp_path):
+    env = Env(tmp_path, DAY.replace(hour=10))
+    await _important(env)
+    env.results = [False]
+    await env.watcher.check_once()
+    await env.watcher.check_once()
+    assert len(env.alerts()) == 2
+    assert env.store.get_triage(1)["alerted_at"] is not None
+    await env.watcher.check_once()
+    assert len(env.alerts()) == 2
+
+
+async def test_alert_submit_raising_counts_as_failure(tmp_path):
+    env = Env(tmp_path, DAY.replace(hour=10))
+    await _important(env)
+    calls = []
+
+    async def boom(text, on_result=None):
+        calls.append(text)
+        raise RuntimeError("queue closed")
+
+    env.watcher._submit = boom
+    await env.watcher.check_once()
+    await env.watcher.check_once()
+    await env.watcher.check_once()
+    assert len(calls) == 2
+    assert env.store.get_triage(1)["alerted_at"] is None
+
+
+async def test_alerts_held_while_briefing_pending(tmp_path):
+    env = Env(tmp_path, DAY.replace(hour=10))
+    pending = {"on": True}
+    env.kw["briefing_pending"] = lambda: pending["on"]
+    env.watcher = env.make()
+    await _important(env, ids=(1, 2))
+    await env.watcher.check_once()
+    assert env.alerts() == []
+    env.store.mark_alerted([1], DAY.replace(hour=10))   # the briefing covered mail 1
+    pending["on"] = False
+    await env.watcher.check_once()
+    (alert,) = env.alerts()
+    assert "Subj 2" in alert and "Subj 1" not in alert
+
+
+async def test_watcher_accepts_and_ignores_briefing_kwargs(tmp_path):
+    env = Env(tmp_path, DAY.replace(hour=7), fitness=True, jobs=True)
+    await baseline(env)
+    env.clock.at = DAY.replace(hour=8, minute=30)
+    await env.watcher.check_once()
+    assert env.sent == []
+    assert env.watcher._jobs is True

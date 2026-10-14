@@ -141,6 +141,14 @@ def html_to_text(html: str) -> str:
     return p.text()
 
 
+def _decode(payload: bytes, charset: str | None) -> str:
+    """Decode with the declared charset; an unknown or invalid one falls back to UTF-8."""
+    try:
+        return payload.decode(charset or "utf-8", errors="replace")
+    except Exception:  # LookupError, ValueError (e.g. embedded NUL), TypeError, ...
+        return payload.decode("utf-8", errors="replace")
+
+
 def _part_text(part: Message) -> str:
     try:
         content = part.get_content()
@@ -148,20 +156,30 @@ def _part_text(part: Message) -> str:
             return content
     except Exception:
         pass
-    payload = part.get_payload(decode=True) or b""
-    charset = part.get_content_charset() or "utf-8"
     try:
-        return payload.decode(charset, errors="replace")
-    except LookupError:
-        return payload.decode("utf-8", errors="replace")
+        payload = part.get_payload(decode=True) or b""
+    except Exception:
+        payload = b""
+    if isinstance(payload, str):
+        return payload
+    if not isinstance(payload, bytes):
+        return ""
+    try:
+        charset = part.get_content_charset()
+    except Exception:
+        charset = None
+    return _decode(payload, charset)
 
 
 def _body_text(msg: Message) -> str:
     plain = html = None
     for part in msg.walk():
-        if part.is_multipart() or part.get_content_disposition() == "attachment":
+        try:
+            if part.is_multipart() or part.get_content_disposition() == "attachment":
+                continue
+            ctype = part.get_content_type()
+        except Exception:  # malformed part headers: skip the part, keep the rest
             continue
-        ctype = part.get_content_type()
         if ctype == "text/plain" and plain is None:
             plain = _part_text(part)
         elif ctype == "text/html" and html is None:
@@ -387,8 +405,13 @@ class MailReader:
             msg = self._parse_emlx(path)
         except OSError as e:
             raise MailNotFound(f"cannot read file for message {id}: {e}") from e
-        head = "\n".join(f"{h}: {_header(msg, h)}" for h in ("From", "To", "Date", "Subject"))
-        out = f"{head}\n\n{_body_text(msg)}"
+        except Exception as e:  # malformed message the email package chokes on
+            raise MailReaderError(f"cannot parse message {id}: {e or type(e).__name__}") from e
+        try:
+            head = "\n".join(f"{h}: {_header(msg, h)}" for h in ("From", "To", "Date", "Subject"))
+            out = f"{head}\n\n{_body_text(msg)}"
+        except Exception as e:  # one bad email must never raise anything but MailReaderError
+            raise MailReaderError(f"cannot decode message {id}: {e or type(e).__name__}") from e
         if len(out) > max_chars:
             out = out[: max(0, max_chars - len(TRUNCATED_MARK))] + TRUNCATED_MARK
             out = out[:max_chars]
