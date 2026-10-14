@@ -89,3 +89,56 @@ def test_in_quiet_hours_same_day_range(t, quiet):
 
 def test_in_quiet_hours_empty_range():
     assert MailConfig(quiet_start=time(8, 0), quiet_end=time(8, 0)).in_quiet_hours(time(8, 0)) is False
+
+# --- [fitness] table ---
+
+from argus.config import FitnessConfig
+
+def test_fitness_defaults(tmp_path: Path):
+    _write(tmp_path)
+    cfg = load_config(tmp_path)
+    f = cfg.fitness
+    assert f == FitnessConfig()
+    assert f.enabled is True and f.plan_path == "data/fitness/CLAUDE.md"
+    assert f.training_days == ("mon", "wed", "fri")
+    assert (f.training_kcal, f.rest_kcal, f.min_kcal) == (2000, 1800, 1200)
+    assert f.protein_g == (100, 150) and f.carbs_g == (150, 250) and f.fat_g == (50, 70)
+    assert f.added_sugar_g_max == 25 and f.sodium_mg_max == 2300
+    assert cfg.fitness_plan_path == tmp_path / "data" / "fitness" / "CLAUDE.md"
+
+def test_fitness_table_parsed(tmp_path: Path):
+    _write(tmp_path, '[fitness]\nenabled = false\nplan_path = "plan.md"\ntraining_days = ["Tue", "sat"]\n'
+                     'training_kcal = 1800\nrest_kcal = 1600\nmin_kcal = 1500\nprotein_g = [160, 170]\n'
+                     'carbs_g = [100, 150.5]\nfat_g = [40, 50]\nadded_sugar_g_max = 20\nsodium_mg_max = 2000\n')
+    cfg = load_config(tmp_path)
+    assert cfg.fitness == FitnessConfig(
+        enabled=False, plan_path="plan.md", training_days=("tue", "sat"), training_kcal=1800,
+        rest_kcal=1600, min_kcal=1500, protein_g=(160, 170), carbs_g=(100, 150.5), fat_g=(40, 50),
+        added_sugar_g_max=20, sodium_mg_max=2000)
+    assert isinstance(cfg.fitness.protein_g, tuple)
+    assert cfg.fitness_plan_path == tmp_path / "plan.md"
+
+def test_fitness_absolute_plan_path(tmp_path: Path):
+    _write(tmp_path, f'[fitness]\nplan_path = "{tmp_path / "elsewhere.md"}"\n')
+    assert load_config(tmp_path).fitness_plan_path == tmp_path / "elsewhere.md"
+
+@pytest.mark.parametrize("line,key", [
+    ('enabled = "yes"', "enabled"), ('plan_path = ""', "plan_path"), ("plan_path = 3", "plan_path"),
+    ('training_days = "mon"', "training_days"), ('training_days = ["monday"]', "training_days"),
+    ("training_days = [1]", "training_days"),
+    ("training_kcal = 0", "training_kcal"), ('rest_kcal = "1600"', "rest_kcal"), ("min_kcal = -1", "min_kcal"),
+    ("training_kcal = true", "training_kcal"),
+    ("protein_g = 160", "protein_g"), ("protein_g = [170, 160]", "protein_g"), ("carbs_g = [1, 2, 3]", "carbs_g"),
+    ('fat_g = ["a", 2]', "fat_g"), ("fat_g = [-1, 2]", "fat_g"),
+    ("added_sugar_g_max = -5", "added_sugar_g_max"), ("sodium_mg_max = false", "sodium_mg_max"),
+    ("bogus = 1", "bogus"),
+])
+def test_fitness_bad_values_rejected(tmp_path: Path, line, key):
+    _write(tmp_path, f"[fitness]\n{line}\n")
+    with pytest.raises(ValueError, match=f"fitness.{key}"):
+        load_config(tmp_path)
+
+def test_fitness_must_be_table(tmp_path: Path):
+    _write(tmp_path, 'fitness = 1\n')
+    with pytest.raises(ValueError, match="fitness"):
+        load_config(tmp_path)

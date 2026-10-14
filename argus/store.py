@@ -1,11 +1,12 @@
 """SQLite persistence for ``data/argus.db``: message archive, sessions, sent ids, key/value state,
-and mail triage verdicts.
+mail triage verdicts, and fitness logs (food, weight, workouts).
 
 This module is the only writer of the database.
 """
 
 from __future__ import annotations
 
+import math
 import sqlite3
 import threading
 from datetime import date, datetime, timedelta
@@ -63,6 +64,40 @@ CREATE TABLE IF NOT EXISTS mail_triage (
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS mail_triage_received ON mail_triage (received_at);
+CREATE TABLE IF NOT EXISTS food_log (
+    id INTEGER PRIMARY KEY,
+    day TEXT NOT NULL,
+    logged_at TEXT NOT NULL,
+    meal TEXT,
+    description TEXT NOT NULL,
+    kcal REAL NOT NULL,
+    protein_g REAL NOT NULL,
+    fat_g REAL NOT NULL,
+    carbs_g REAL NOT NULL,
+    added_sugar_g REAL,
+    sodium TEXT,
+    note TEXT,
+    deleted INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS food_log_day ON food_log (day);
+CREATE TABLE IF NOT EXISTS weight_log (
+    id INTEGER PRIMARY KEY,
+    day TEXT NOT NULL,
+    logged_at TEXT NOT NULL,
+    weight_kg REAL NOT NULL,
+    waist_cm REAL,
+    note TEXT
+);
+CREATE INDEX IF NOT EXISTS weight_log_day ON weight_log (day);
+CREATE TABLE IF NOT EXISTS workout_log (
+    id INTEGER PRIMARY KEY,
+    day TEXT NOT NULL,
+    logged_at TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    description TEXT,
+    note TEXT
+);
+CREATE INDEX IF NOT EXISTS workout_log_day ON workout_log (day);
 """
 
 # Rebuilds ``messages`` (keeping ids) with the current sender CHECK; run inside one transaction.
@@ -85,12 +120,74 @@ _TRIAGE_FIELDS = (
     "summary", "action", "deadline", "status", "attempts",
 )
 
+MEALS = ("breakfast", "lunch", "dinner", "snack", "pre_workout", "other")
+SODIUM_LEVELS = ("low", "medium", "high")
+WORKOUT_KINDS = ("A", "B", "cardio", "other")
+IMPORTED_PREFIX = "[imported]"
+
+# Upper bounds for a single food entry; larger values are almost certainly estimation mistakes.
+_FOOD_MAX = {"kcal": 5000, "protein_g": 300, "fat_g": 500, "carbs_g": 1000, "added_sugar_g": 500}
+_FOOD_UPDATABLE = (
+    "day", "meal", "description", "kcal", "protein_g", "fat_g", "carbs_g", "added_sugar_g", "sodium", "note",
+)
+_FOOD_COLUMNS = (
+    "id, day, logged_at, meal, description, kcal, protein_g, fat_g, carbs_g, added_sugar_g, sodium, note, deleted"
+)
+
 # The trigram tokenizer cannot match terms shorter than 3 characters.
 _MIN_FTS_TERM = 3
 
 
 def _ts(dt: datetime) -> str:
     return dt.isoformat(timespec="seconds")
+
+
+def _check_amount(name: str, value: object, maximum: float | None = None, positive: bool = False) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        raise ValueError(f"{name} must be a finite number, got {value!r}")
+    if value < 0 or (positive and value == 0):
+        raise ValueError(f"{name} must be {'> 0' if positive else '>= 0'}, got {value!r}")
+    if maximum is not None and value > maximum:
+        raise ValueError(f"{name} must be <= {maximum:g}, got {value!r}")
+    return float(value)
+
+
+def _check_choice(name: str, value: object, choices: tuple[str, ...], nullable: bool = True) -> str | None:
+    if value is None and nullable:
+        return None
+    if value not in choices:
+        raise ValueError(f"{name} must be one of {', '.join(choices)}, got {value!r}")
+    return value
+
+
+def _check_text(name: str, value: object) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{name} must be a non-empty string, got {value!r}")
+    return value.strip()
+
+
+def _check_note(value: object) -> str | None:
+    if value is not None and not isinstance(value, str):
+        raise ValueError(f"note must be a string, got {value!r}")
+    return value
+
+
+def _check_food_field(name: str, value: object) -> object:
+    if name == "day":
+        if not isinstance(value, date) or isinstance(value, datetime):
+            raise ValueError(f"day must be a date, got {value!r}")
+        return value.isoformat()
+    if name == "meal":
+        return _check_choice("meal", value, MEALS)
+    if name == "sodium":
+        return _check_choice("sodium", value, SODIUM_LEVELS)
+    if name == "description":
+        return _check_text("description", value)
+    if name == "note":
+        return _check_note(value)
+    if name == "added_sugar_g" and value is None:
+        return None
+    return _check_amount(name, value, _FOOD_MAX[name])
 
 
 def _escape_like(term: str) -> str:
@@ -313,6 +410,141 @@ class Store:
                 f"UPDATE mail_triage SET {column} = ? WHERE mail_id = ?",
                 [(_ts(at), i) for i in mail_ids],
             )
+
+    # --- fitness: food log (soft delete), weights, workouts ---
+
+    def add_food(
+        self,
+        day: date,
+        logged_at: datetime,
+        description: str,
+        kcal: float,
+        protein_g: float,
+        fat_g: float,
+        carbs_g: float,
+        added_sugar_g: float | None = None,
+        sodium: str | None = None,
+        meal: str | None = None,
+        note: str | None = None,
+    ) -> int:
+        """Record one food entry for Argus day ``day``; raise ``ValueError`` on invalid values."""
+        values = {
+            name: _check_food_field(name, value)
+            for name, value in (
+                ("day", day), ("meal", meal), ("description", description), ("kcal", kcal),
+                ("protein_g", protein_g), ("fat_g", fat_g), ("carbs_g", carbs_g),
+                ("added_sugar_g", added_sugar_g), ("sodium", sodium), ("note", note),
+            )
+        }
+        values["logged_at"] = _ts(logged_at)
+        cur = self._write(
+            f"INSERT INTO food_log ({', '.join(values)}) VALUES ({', '.join('?' * len(values))})",
+            tuple(values.values()),
+        )
+        return cur.lastrowid
+
+    def update_food(self, id: int, **fields) -> dict:
+        """Change fields of a live entry and return the updated row.
+
+        Raise ``ValueError`` for unknown/invalid fields, ``KeyError`` if the entry is missing or deleted.
+        """
+        if not fields:
+            raise ValueError("no fields to update")
+        unknown = sorted(set(fields) - set(_FOOD_UPDATABLE))
+        if unknown:
+            raise ValueError(f"cannot update field(s): {', '.join(unknown)}")
+        values = {name: _check_food_field(name, value) for name, value in fields.items()}
+        assignments = ", ".join(f"{name} = ?" for name in values)
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                f"UPDATE food_log SET {assignments} WHERE id = ? AND deleted = 0",
+                (*values.values(), id),
+            )
+            if cur.rowcount == 0:
+                raise KeyError(f"food entry {id} not found")
+            row = self._conn.execute(f"SELECT {_FOOD_COLUMNS} FROM food_log WHERE id = ?", (id,)).fetchone()
+        return dict(row)
+
+    def delete_food(self, id: int) -> dict:
+        """Soft-delete a live entry and return it; ``KeyError`` if missing or already deleted."""
+        with self._lock, self._conn:
+            cur = self._conn.execute("UPDATE food_log SET deleted = 1 WHERE id = ? AND deleted = 0", (id,))
+            if cur.rowcount == 0:
+                raise KeyError(f"food entry {id} not found")
+            row = self._conn.execute(f"SELECT {_FOOD_COLUMNS} FROM food_log WHERE id = ?", (id,)).fetchone()
+        return dict(row)
+
+    def foods_for_day(self, day: date) -> list[dict]:
+        return self.foods_between(day, day)
+
+    def foods_between(self, start: date, end: date) -> list[dict]:
+        """Live entries with ``start <= day <= end``, ordered by day, logged_at, id."""
+        rows = self._read(
+            f"SELECT {_FOOD_COLUMNS} FROM food_log WHERE deleted = 0 AND day >= ? AND day <= ? "
+            "ORDER BY day, logged_at, id",
+            (start.isoformat(), end.isoformat()),
+        )
+        return [dict(r) for r in rows]
+
+    def add_weight(
+        self,
+        day: date,
+        logged_at: datetime,
+        weight_kg: float,
+        waist_cm: float | None = None,
+        note: str | None = None,
+    ) -> int:
+        weight = _check_amount("weight_kg", weight_kg, 500, positive=True)
+        waist = None if waist_cm is None else _check_amount("waist_cm", waist_cm, 300, positive=True)
+        cur = self._write(
+            "INSERT INTO weight_log (day, logged_at, weight_kg, waist_cm, note) VALUES (?, ?, ?, ?, ?)",
+            (_check_food_field("day", day), _ts(logged_at), weight, waist, _check_note(note)),
+        )
+        return cur.lastrowid
+
+    def weights_between(self, start: date, end: date) -> list[dict]:
+        """Entries with ``start <= day <= end``, ordered by day, logged_at, id."""
+        rows = self._read(
+            "SELECT id, day, logged_at, weight_kg, waist_cm, note FROM weight_log "
+            "WHERE day >= ? AND day <= ? ORDER BY day, logged_at, id",
+            (start.isoformat(), end.isoformat()),
+        )
+        return [dict(r) for r in rows]
+
+    def add_workout(
+        self,
+        day: date,
+        logged_at: datetime,
+        kind: str,
+        description: str | None = None,
+        note: str | None = None,
+    ) -> int:
+        _check_choice("kind", kind, WORKOUT_KINDS, nullable=False)
+        cur = self._write(
+            "INSERT INTO workout_log (day, logged_at, kind, description, note) VALUES (?, ?, ?, ?, ?)",
+            (_check_food_field("day", day), _ts(logged_at), kind, _check_note(description), _check_note(note)),
+        )
+        return cur.lastrowid
+
+    def workouts_between(self, start: date, end: date) -> list[dict]:
+        """Entries with ``start <= day <= end``, ordered by day, logged_at, id."""
+        rows = self._read(
+            "SELECT id, day, logged_at, kind, description, note FROM workout_log "
+            "WHERE day >= ? AND day <= ? ORDER BY day, logged_at, id",
+            (start.isoformat(), end.isoformat()),
+        )
+        return [dict(r) for r in rows]
+
+    def imported_days(self, kind: Literal["food", "weight"]) -> set[date]:
+        """Days that already have a row imported from the Markdown logs (deleted food rows included)."""
+        table = {"food": "food_log", "weight": "weight_log"}.get(kind)
+        if table is None:
+            raise ValueError(f"kind must be 'food' or 'weight', got {kind!r}")
+        rows = self._read(
+            f"SELECT DISTINCT day FROM {table} WHERE substr(note, 1, ?) = ?",
+            (len(IMPORTED_PREFIX), IMPORTED_PREFIX),
+        )
+        return {date.fromisoformat(r["day"]) for r in rows}
 
 
 def _triage_dict(row: sqlite3.Row) -> dict:

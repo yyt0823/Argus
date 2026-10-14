@@ -242,3 +242,150 @@ def test_mark_alerted_and_briefed(store):
     assert [store.get_triage(i)["alerted_at"] for i in (1, 2, 3)] == ["2026-10-14T09:00:00", None, "2026-10-14T09:00:00"]
     assert store.get_triage(2)["briefed_at"] == "2026-10-15T08:00:00"
     assert store.get_triage(1)["briefed_at"] is None
+
+# --- fitness: food / weight / workout logs ---
+
+D1, D2, D3 = date(2026, 10, 1), date(2026, 10, 2), date(2026, 10, 3)
+
+def _food(store, day=D1, at=None, **kw):
+    args = dict(description="oats", kcal=300, protein_g=10, fat_g=5, carbs_g=50)
+    args.update(kw)
+    return store.add_food(day, at or datetime.combine(day, datetime.min.time()).replace(hour=8), **args)
+
+def test_add_food_roundtrip(store):
+    fid = _food(store, added_sugar_g=3, sodium="low", meal="breakfast", note="n")
+    [row] = store.foods_for_day(D1)
+    assert row["id"] == fid and row["day"] == "2026-10-01" and row["logged_at"] == "2026-10-01T08:00:00"
+    assert (row["description"], row["kcal"], row["protein_g"], row["fat_g"], row["carbs_g"]) == ("oats", 300, 10, 5, 50)
+    assert (row["added_sugar_g"], row["sodium"], row["meal"], row["note"], row["deleted"]) == (3, "low", "breakfast", "n", 0)
+
+def test_add_food_optional_fields_default_none(store):
+    _food(store)
+    [row] = store.foods_for_day(D1)
+    assert row["added_sugar_g"] is None and row["sodium"] is None and row["meal"] is None and row["note"] is None
+
+def test_foods_for_day_ordered_and_scoped(store):
+    b = _food(store, at=datetime(2026, 10, 1, 12), description="b")
+    a = _food(store, at=datetime(2026, 10, 1, 8), description="a")
+    a2 = _food(store, at=datetime(2026, 10, 1, 8), description="a2")
+    _food(store, day=D2, description="other day")
+    assert [r["id"] for r in store.foods_for_day(D1)] == [a, a2, b]
+
+def test_food_day_is_explicit_not_from_logged_at(store):
+    # a 01:00 snack belongs to the previous Argus day; the caller passes that day
+    _food(store, day=D1, at=datetime(2026, 10, 2, 1, 0), description="late snack")
+    assert [r["description"] for r in store.foods_for_day(D1)] == ["late snack"]
+    assert store.foods_for_day(D2) == []
+
+def test_foods_between_inclusive(store):
+    for d in (D1, D2, D3):
+        _food(store, day=d, description=d.isoformat())
+    assert [r["description"] for r in store.foods_between(D1, D2)] == ["2026-10-01", "2026-10-02"]
+
+@pytest.mark.parametrize("kw", [
+    {"kcal": -1}, {"protein_g": -0.1}, {"fat_g": -1}, {"carbs_g": -1}, {"added_sugar_g": -1},
+    {"kcal": 5001}, {"protein_g": 301}, {"kcal": float("nan")}, {"kcal": float("inf")}, {"kcal": "100"},
+    {"kcal": True}, {"meal": "brunch"}, {"sodium": "extreme"}, {"description": "  "},
+])
+def test_add_food_validation(store, kw):
+    with pytest.raises(ValueError):
+        _food(store, **kw)
+    assert store.foods_for_day(D1) == []
+
+def test_add_food_accepts_all_meals_and_sodium(store):
+    for meal in ("breakfast", "lunch", "dinner", "snack", "pre_workout", "other", None):
+        _food(store, meal=meal)
+    for sodium in ("low", "medium", "high", None):
+        _food(store, sodium=sodium)
+    assert len(store.foods_for_day(D1)) == 11
+
+def test_update_food(store):
+    fid = _food(store)
+    row = store.update_food(fid, kcal=250, protein_g=12.5, meal="snack", note="fixed", added_sugar_g=None)
+    assert row["kcal"] == 250 and row["protein_g"] == 12.5 and row["meal"] == "snack" and row["note"] == "fixed"
+    assert store.foods_for_day(D1)[0] == row
+
+def test_update_food_can_move_day(store):
+    fid = _food(store)
+    row = store.update_food(fid, day=D2)
+    assert row["day"] == "2026-10-02" and store.foods_for_day(D1) == []
+
+def test_update_food_rejects_bad_fields(store):
+    fid = _food(store)
+    with pytest.raises(ValueError):
+        store.update_food(fid, logged_at=datetime(2026, 10, 1))
+    with pytest.raises(ValueError):
+        store.update_food(fid, deleted=1)
+    with pytest.raises(ValueError):
+        store.update_food(fid, kcal=-5)
+    with pytest.raises(ValueError):
+        store.update_food(fid, sodium="salty")
+    with pytest.raises(ValueError):
+        store.update_food(fid)
+    assert store.foods_for_day(D1)[0]["kcal"] == 300
+
+def test_update_food_missing_or_deleted(store):
+    with pytest.raises(KeyError):
+        store.update_food(999, kcal=1)
+    fid = _food(store)
+    store.delete_food(fid)
+    with pytest.raises(KeyError):
+        store.update_food(fid, kcal=1)
+
+def test_delete_food_is_soft(store):
+    fid = _food(store)
+    keep = _food(store, description="keep")
+    row = store.delete_food(fid)
+    assert row["id"] == fid and row["deleted"] == 1
+    assert [r["id"] for r in store.foods_for_day(D1)] == [keep]
+    assert [r["id"] for r in store.foods_between(D1, D1)] == [keep]
+    with pytest.raises(KeyError):
+        store.delete_food(fid)
+    with pytest.raises(KeyError):
+        store.delete_food(12345)
+    # the row is still in the database
+    assert store._read("SELECT deleted FROM food_log WHERE id = ?", (fid,))[0]["deleted"] == 1
+
+def test_weights(store):
+    store.add_weight(D2, datetime(2026, 10, 2, 7), 70.5, waist_cm=80, note="am")
+    wid = store.add_weight(D1, datetime(2026, 10, 1, 7), 71.0)
+    store.add_weight(D3, datetime(2026, 10, 3, 7), 70.0)
+    rows = store.weights_between(D1, D2)
+    assert [r["weight_kg"] for r in rows] == [71.0, 70.5]
+    assert rows[0]["id"] == wid and rows[0]["waist_cm"] is None and rows[1]["waist_cm"] == 80
+    assert rows[1]["note"] == "am" and rows[1]["day"] == "2026-10-02"
+
+@pytest.mark.parametrize("kw", [{"weight_kg": 0}, {"weight_kg": -70}, {"weight_kg": 700}, {"waist_cm": -1}])
+def test_add_weight_validation(store, kw):
+    args = {"weight_kg": 70.0}
+    args.update(kw)
+    with pytest.raises(ValueError):
+        store.add_weight(D1, datetime(2026, 10, 1, 7), **args)
+
+def test_workouts(store):
+    store.add_workout(D1, datetime(2026, 10, 1, 18), "A", description="squat", note="good")
+    store.add_workout(D2, datetime(2026, 10, 2, 18), "cardio")
+    rows = store.workouts_between(D1, D1)
+    assert len(rows) == 1 and rows[0]["kind"] == "A" and rows[0]["description"] == "squat"
+    assert [r["kind"] for r in store.workouts_between(D1, D3)] == ["A", "cardio"]
+
+@pytest.mark.parametrize("kind", ["C", "a", "", "run"])
+def test_add_workout_rejects_kind(store, kind):
+    with pytest.raises(ValueError):
+        store.add_workout(D1, datetime(2026, 10, 1, 18), kind)
+
+def test_imported_days(store):
+    _food(store, day=D1, note="[imported] x")
+    fid = _food(store, day=D2, note="[imported] y")
+    store.delete_food(fid)  # a deleted imported row still counts as imported
+    _food(store, day=D3, note="manual")
+    store.add_weight(D1, datetime(2026, 10, 1, 7), 70, note="[imported]")
+    assert store.imported_days("food") == {D1, D2}
+    assert store.imported_days("weight") == {D1}
+    with pytest.raises(ValueError):
+        store.imported_days("workout")
+
+def test_fitness_tables_survive_reopen(tmp_path):
+    p = tmp_path / "x.db"
+    s = Store(p); _food(s); s.close()
+    s2 = Store(p); assert len(s2.foods_for_day(D1)) == 1; s2.close()

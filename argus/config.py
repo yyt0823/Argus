@@ -30,6 +30,30 @@ class MailConfig:
         return t >= self.quiet_start or t < self.quiet_end
 
 
+WEEKDAYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
+
+
+@dataclass(frozen=True)
+class FitnessConfig:
+    """The optional ``[fitness]`` table: daily nutrition budgets and the plan file.
+
+    Defaults are generic placeholders; personal values belong in ``argus.toml``.
+    Ranges are ``(low, high)`` grams per day.
+    """
+
+    enabled: bool = True
+    plan_path: str = "data/fitness/CLAUDE.md"
+    training_days: tuple[str, ...] = ("mon", "wed", "fri")
+    training_kcal: float = 2000
+    rest_kcal: float = 1800
+    min_kcal: float = 1200
+    protein_g: tuple[float, float] = (100, 150)
+    carbs_g: tuple[float, float] = (150, 250)
+    fat_g: tuple[float, float] = (50, 70)
+    added_sugar_g_max: float = 25
+    sodium_mg_max: float = 2300
+
+
 @dataclass(frozen=True)
 class Config:
     root: Path
@@ -45,6 +69,7 @@ class Config:
     model: str | None = None
     mode: str = "self"
     mail: MailConfig = field(default_factory=MailConfig)
+    fitness: FitnessConfig = field(default_factory=FitnessConfig)
 
     @property
     def data_dir(self) -> Path:
@@ -65,6 +90,11 @@ class Config:
     @property
     def logs_dir(self) -> Path:
         return self.root / "logs"
+
+    @property
+    def fitness_plan_path(self) -> Path:
+        """``fitness.plan_path`` resolved against ``root`` (absolute paths are kept)."""
+        return self.root / Path(self.fitness.plan_path).expanduser()
 
 
 MODES = ("self", "contact")
@@ -97,6 +127,7 @@ def load_config(root: Path) -> Config:
     if "chat_db" in raw:
         kwargs["chat_db"] = Path(raw["chat_db"]).expanduser()
     kwargs["mail"] = _load_mail(raw.get("mail", {}), path)
+    kwargs["fitness"] = _load_fitness(raw.get("fitness", {}), path)
     return Config(root=root, self_handles=tuple(h.strip() for h in handles), **kwargs)
 
 
@@ -136,3 +167,65 @@ def _load_mail(raw: object, path: Path) -> MailConfig:
             raise ValueError(f"{path}: mail.triage_model must be a non-empty string, got {value!r}")
         kwargs["triage_model"] = value.strip()
     return MailConfig(**kwargs)
+
+
+_FITNESS_NUMBER_KEYS = ("training_kcal", "rest_kcal", "min_kcal", "added_sugar_g_max", "sodium_mg_max")
+_FITNESS_RANGE_KEYS = ("protein_g", "carbs_g", "fat_g")
+_FITNESS_KEYS = ("enabled", "plan_path", "training_days", *_FITNESS_NUMBER_KEYS, *_FITNESS_RANGE_KEYS)
+
+
+def _is_number(value: object) -> bool:
+    return not isinstance(value, bool) and isinstance(value, (int, float))
+
+
+def _load_fitness(raw: object, path: Path) -> FitnessConfig:
+    """Validate the optional ``[fitness]`` table; raise ``ValueError`` naming ``fitness.<key>``."""
+    if not isinstance(raw, dict):
+        raise ValueError(f"{path}: fitness must be a table ([fitness])")
+    unknown = sorted(set(raw) - set(_FITNESS_KEYS))
+    if unknown:
+        raise ValueError(
+            f"{path}: unknown key(s) in [fitness]: {', '.join('fitness.' + k for k in unknown)}"
+        )
+
+    kwargs: dict = {}
+    if "enabled" in raw:
+        if not isinstance(raw["enabled"], bool):
+            raise ValueError(f"{path}: fitness.enabled must be true or false")
+        kwargs["enabled"] = raw["enabled"]
+    if "plan_path" in raw:
+        value = raw["plan_path"]
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"{path}: fitness.plan_path must be a non-empty string, got {value!r}")
+        kwargs["plan_path"] = value.strip()
+    if "training_days" in raw:
+        value = raw["training_days"]
+        days = [d.strip().lower() for d in value if isinstance(d, str)] if isinstance(value, list) else None
+        if days is None or len(days) != len(value) or not set(days) <= set(WEEKDAYS):
+            raise ValueError(
+                f"{path}: fitness.training_days must be a list of {'/'.join(WEEKDAYS)}, got {value!r}"
+            )
+        kwargs["training_days"] = tuple(days)
+    for key in _FITNESS_NUMBER_KEYS:
+        if key in raw:
+            value = raw[key]
+            positive = key.endswith("kcal") and key != "min_kcal"
+            if not _is_number(value) or value < 0 or (positive and value == 0):
+                kind = "a positive" if positive else "a non-negative"
+                raise ValueError(f"{path}: fitness.{key} must be {kind} number, got {value!r}")
+            kwargs[key] = value
+    for key in _FITNESS_RANGE_KEYS:
+        if key in raw:
+            value = raw[key]
+            if (
+                not isinstance(value, list)
+                or len(value) != 2
+                or not all(_is_number(v) and v >= 0 for v in value)
+                or value[0] > value[1]
+            ):
+                raise ValueError(
+                    f"{path}: fitness.{key} must be [low, high] non-negative numbers with low <= high, "
+                    f"got {value!r}"
+                )
+            kwargs[key] = (value[0], value[1])
+    return FitnessConfig(**kwargs)
