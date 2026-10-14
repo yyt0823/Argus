@@ -1,0 +1,13 @@
+# Personal data — never commit
+data/
+memory/
+backups/
+logs/
+
+# Local editor settings
+.vscode/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
