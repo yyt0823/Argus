@@ -36,7 +36,9 @@ class Brain:
         session = await self._ensure_session()
         row_id = self._row_id
         self._store.add_message("user", text, self._now(), session_id=row_id)
-        reply = await session.ask(text)  # Interrupted / SessionError propagate
+        # The session's system prompt only knows when the session started; tell Claude the time now.
+        stamped = f"[{self._now():%Y-%m-%d %H:%M}] {text}"
+        reply = await session.ask(stamped)  # Interrupted / SessionError propagate
         sdk_id = session.sdk_session_id
         if sdk_id and sdk_id != self._stored_sdk_id:
             self._store.set_session_sdk_id(row_id, sdk_id)

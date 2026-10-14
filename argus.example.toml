@@ -1,0 +1,27 @@
+# Argus configuration.
+# Copy this file to argus.toml (git-ignored) and fill in your own handles.
+
+# Required: your own iMessage handles (phone number in E.164 form and/or Apple ID email).
+# Argus answers messages you send to yourself in the self-chat with these handles.
+self_handles = ["+15550000000"]
+# self_handles = ["+15550000000", "someone@example.com"]
+
+# --- Optional settings (defaults shown) ---
+
+# Path to the Messages database.
+# chat_db = "~/Library/Messages/chat.db"
+
+# Seconds between chat.db polls.
+# poll_interval = 1.0
+
+# Local hour at which the daily session rolls over and backups are taken.
+# rollover_hour = 4
+
+# Seconds before Argus sends a "still working" notice.
+# slow_notice_seconds = 15.0
+
+# Number of daily backups to keep.
+# backup_keep = 30
+
+# Claude model to use; omit to use the Claude Code default.
+# model = "sonnet"
