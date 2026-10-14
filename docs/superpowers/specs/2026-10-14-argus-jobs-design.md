@@ -1,82 +1,98 @@
 # Argus Internship Search + Auto-Apply — Design and Plan
 
-- Date: 2026-10-14
-- Status: Requirements from the user ("every morning look for new openings and apply for me; I'll also ask whether there are new openings, then search"); the user asked for full implementation without further check-ins.
-- Scope: Roadmap sub-project 5 (applications), internships only. Builds on Core, mail (internal tasks, briefing) and the user's local profile archive.
+- Date: 2026-10-14 (revised the same day after finding the user's existing workflow)
+- Status: Requirements from the user ("every morning look for new openings and apply for me, using the Claude in Chrome extension; I'll also ask whether there are new openings, then search"); full implementation requested without further check-ins.
+- Scope: Roadmap sub-project 5 (applications). Builds on Core, mail (internal tasks, briefing) and the user's local archive.
 
-## 1. Goals
+## 1. Key decision: automate the user's existing workflow
 
-1. Every morning, find new internship postings that fit the user (target from the profile: Summer/Winter 2027 SWE / backend / AI-agent internships; Canadian PR, so Canada roles need no sponsorship, US roles do).
-2. Score each new posting for fit, report the best ones in the 08:00 briefing.
-3. Apply automatically to high-fit postings on standard ATS forms (Greenhouse, Lever, Ashby), with a per-day cap; anything that can't be completed automatically is sent to the user as a link with the reason.
-4. On request ("有没有新的 opening？"), run a search immediately and answer.
+The user already runs internship search and applications by hand with Claude Code subagents, using files in `data/about_me/internships/` (git-ignored):
 
-### Non-goals
-
-- LinkedIn/Indeed automation (their terms forbid it; account-ban risk). Workday and custom portals (too varied; reported as links). Cover-letter-required postings are applied to only if the form accepts an optional/free-text cover letter generated from the profile.
-- Bypassing CAPTCHAs or bot checks: if one appears, stop and send the link.
-
-## 2. Inputs
-
-- **Profile archive** `data/about_me/` (git-ignored): `PROFILE.md` (source of truth for contact data — phone/email/links), `EDUCATION.md`, `WORK_AND_PROJECTS.md`, `OPEN_QUESTIONS.md`, `SENSITIVE_IDS.md` (never used by the job pipeline), `extracted_text/` (CV text).
-- **Applicant data** `data/about_me/applicant.toml` (generated once by Argus from `PROFILE.md`, then user-editable; git-ignored): name, email, phone, location, LinkedIn, GitHub, website, school, degree, graduation date, work authorization answers (Canada: authorized, no sponsorship; US: requires sponsorship), EEO answers default "decline to self-identify", résumé PDF path.
-- **Résumé PDF**: path in `applicant.toml`. Before any auto-apply, Argus checks the PDF's text contains the phone number from `applicant.toml`; if not (e.g. outdated CV with the old number), auto-apply is blocked and the user is told why.
-
-## 3. Sources
-
-| Source | How |
+| File | Role |
 |---|---|
-| Community internship lists | GitHub repos maintained for the season (e.g. `SimplifyJobs/Summer2027-Internships`, and the off-season/Winter list if present); parse the README table (company, role, location, link, date). Repo names are config. |
-| Greenhouse boards | `GET https://boards-api.greenhouse.io/v1/boards/<token>/jobs?content=true` |
-| Lever | `GET https://api.lever.co/v0/postings/<company>?mode=json` |
-| Ashby | `GET https://api.ashbyhq.com/posting-api/job-board/<org>?includeCompensation=false` |
+| `README.md` | Search profile and conventions (Canada only, Montréal first; Winter/Summer 2027 SWE / backend / AI / AI-agent internships or co-ops; also new-grad roles) |
+| `seen_companies.txt` | Companies already covered — every search reads it first, skips them, appends new ones |
+| `INTERNSHIPS.md` | Cumulative tracker; each search session appends a dated section with tables (Company, Role, City, Term, Deadline, Fit 1–5, Notes, URL, Verified) |
+| `raw/` | Raw per-agent findings per session |
+| `APPLY_BRIEF.md` | The brief for application agents: hard rules, facts, answers, Workday tips |
+| `FOLLOW_UPS.md` | Assessments, interviews, recruiter replies |
+| `applications/` | Per-company files |
 
-A company watchlist (`[jobs] greenhouse = [...]`, `lever = [...]`, `ashby = [...]`) ships with a starter list of tech companies whose board tokens were verified to respond. Filters before scoring: title matches intern/co-op/internship; season text or posting mentions 2027 (or no season and posted within 60 days); location in Canada, remote, or US (US flagged "needs sponsorship"). Postings are de-duplicated by canonical URL.
+Argus runs the same two kinds of agents on a schedule and on request, instead of a new pipeline. This covers Workday (most large employers), which an ATS-API approach would not.
 
-## 4. Scoring
+The résumé to upload is `data/about_me/yantian_yin_cv.pdf` (has the current phone number). Contact facts come from `PROFILE.md` / `APPLY_BRIEF.md`, never from older CVs.
 
-One tool-less Claude call per new candidate (model `haiku`, like mail triage): input = posting title/company/location/description excerpt (untrusted, wrapped) + a short profile summary built from the archive (skills, experience, graduation date, authorization). Output JSON: `fit` 0–100, `reasons` (one sentence, Chinese), `season`, `needs_sponsorship` bool, `red_flags`. Postings with fit ≥ `min_fit_report` (default 60) appear in the briefing.
+## 2. Components
 
-## 5. Applying
+```
+argus/jobs/
+├── scout.py      # one isolated SDK agent run: search → update tracker files → return new postings (JSON)
+├── applier.py    # one isolated SDK agent run per posting: apply in the user's Chrome via Claude in Chrome → result (JSON)
+├── guard.py      # can_use_tool policy: which files each agent may read/write
+└── scheduler.py  # daily 07:30 scout (+ auto-apply if enabled), queue of applications
+argus/tools/jobs.py   # chat tools
+```
 
-- Browser automation with **Playwright (Chromium)** using a persistent profile at `data/browser-profile/` (git-ignored), headless by default.
-- Supported forms: Greenhouse (`boards.greenhouse.io`, `job-boards.greenhouse.io`), Lever (`jobs.lever.co`), Ashby (`jobs.ashbyhq.com`). Each has an adapter that maps known fields (name, email, phone, résumé upload, LinkedIn, GitHub, website, school, graduation, work authorization, sponsorship, EEO).
-- Unknown required questions: a tool-less Claude call answers from the profile summary (no sensitive IDs); questions that can't be answered truthfully from the profile (e.g. "Are you available full-time in Jan 2027?" when unknown) → stop, mark `needs_user`, send the link and the question.
-- Before submit: screenshot to `data/jobs/<id>/before_submit.png`; after submit: verify the confirmation page/text, screenshot `after_submit.png`. Any doubt → status `failed` with reason, never retried automatically more than once.
-- **Modes** (config `[jobs] auto_apply`):
-  - `false` (default until the user flips it): Argus prepares and reports "I would apply to N postings"; the user can say "申请 <id>" to apply to one (explicit request).
-  - `true`: Argus applies to postings with fit ≥ `min_fit_apply` (default 80), at most `daily_apply_limit` (default 10) per day.
-- Rate limiting and politeness: ≤ 1 request/second per host for API fetches; one application at a time.
+### Scout agent (search)
+- `claude_agent_sdk.query()` with tools `WebSearch`, `WebFetch`, `Read`, `Write`, `Edit`, `Glob`, `Grep`; `cwd = data/about_me/internships`; `setting_sources=[]`; `strict_mcp_config=True`; `max_turns ≈ 60`; model default.
+- Prompt: follow `README.md`; read `seen_companies.txt` and `../PROFILE.md`; search for postings opened since the last session (Canada only; Montréal first); verify each posting is live; append a dated session section to `INTERNSHIPS.md` in the existing table format, save raw notes to `raw/<date>_argus.md`, append new companies to `seen_companies.txt`; finish with a JSON block listing new postings `{company, role, city, term, deadline, fit (1–5), notes, url, verified, ats}`.
+- `guard.py` restricts file access: Read allowed under `data/about_me/` except `SENSITIVE_IDS.md`, `documents/`, and image/PDF files; Write/Edit allowed only under `data/about_me/internships/`. Anything else is denied.
 
-## 6. Data (SQLite)
+### Applier agent (apply)
+- `ClaudeSDKClient`/`query()` with `extra_args={"chrome": None}`, `cli_path` = the installed `claude` (`/opt/homebrew/bin/claude`; using the SDK's bundled CLI would repoint the user's Chrome native host into the venv), `setting_sources=[]`, `permission_mode="bypassPermissions"` restricted by `guard.py` (Chrome tools + Read of `APPLY_BRIEF.md`, `PROFILE.md`, `EDUCATION.md`, `WORK_AND_PROJECTS.md`, the résumé path for upload; Write only to `internships/applications/`), `max_turns ≈ 120`, one posting per run, at most one applier at a time.
+- System prompt = `APPLY_BRIEF.md` verbatim, plus: résumé path override to `data/about_me/yantian_yin_cv.pdf`; check the Chrome connection first (`tabs_context_mcp`) and stop with `chrome_not_connected` if the extension isn't connected; never use `select_browser`/`switch_browser` prompts; finish with a JSON block `{company, role, req_id, result: submitted|needs_login|needs_attestation|skipped|error, detail, follow_up, guessed_answers}`.
+- The brief's hard rules stay in force (no passwords, no account creation, no attestation ticks, no fabrication, code-writing roles only).
 
-`job_postings(id, source, company, title, location, url UNIQUE, ats, posted_at, first_seen_at, description_excerpt, fit, reasons, season, needs_sponsorship, status, status_reason, applied_at, screenshot_dir)`; status ∈ `new`, `reported`, `skipped`, `applying`, `applied`, `needs_user`, `failed`.
+## 3. Data
 
-## 7. Tools (chat session)
+`job_postings(id, company, role, city, term, deadline, fit, notes, url UNIQUE, verified, ats, first_seen_at, status, status_detail, applied_at, follow_up)`; status ∈ `new`, `reported`, `queued`, `applying`, `submitted`, `needs_login`, `needs_attestation`, `skipped`, `error`. `job_runs(id, kind scout|apply, started_at, finished_at, ok, summary, cost_usd)`.
+
+## 4. Modes and limits (`[jobs]` in argus.toml)
+
+| Key | Default | Meaning |
+|---|---|---|
+| `enabled` | true | |
+| `scout_time` | "07:30" | Daily search |
+| `auto_apply` | true | Apply automatically to postings with `fit ≥ min_fit_apply` found by the daily scout (the user asked for automatic applications; set false to only report) |
+| `min_fit_apply` | 4 | On the tracker's 1–5 scale |
+| `daily_apply_limit` | 8 | Max automatic applications per day |
+| `apply_window` | ["08:30", "22:00"] | Only apply while the user is likely awake (they may need to tick an attestation box) |
+| `internships_dir` | "data/about_me/internships" | |
+| `resume_path` | "data/about_me/yantian_yin_cv.pdf" | |
+| `cli_path` | "/opt/homebrew/bin/claude" | CLI used for Chrome |
+
+## 5. User-facing behavior
+
+- 08:00 briefing gains a jobs section: new postings found this morning (best first, with deadlines) and applications submitted / needing action (login, attestation tick) since yesterday.
+- After each automatic application, no separate message unless it needs the user (needs_login / needs_attestation / error) — then a short alert with the link.
+- Chat: "有没有新的 opening?" → `jobs_scout_now` (runs the scout; takes minutes — Argus first replies that it's searching, then reports via an internal task when done). "申请 3 号" → `job_apply`. "我申请了哪些?" → `jobs_list`.
+
+## 6. Tools (chat session)
 
 | Tool | Purpose |
 |---|---|
-| `jobs_scan_now` | Run the fetch + filter + score pipeline now; return new candidates (for "有没有新的 opening") |
-| `jobs_list` | List postings by status / min fit / date |
-| `job_apply` | Apply to one posting by id (explicit user request; works in either mode) |
-| `job_skip` | Mark a posting skipped |
-| `jobs_profile_check` | Report applicant data, résumé PDF phone check, and any OPEN_QUESTIONS that affect forms |
+| `jobs_scout_now` | Start a scout run in the background; result arrives as an internal task |
+| `jobs_list` | Postings by status / fit / date (from SQLite) |
+| `job_apply` | Queue an application for one posting id (explicit request; ignores auto_apply/fit limits but respects one-at-a-time) |
+| `job_skip` | Mark skipped |
+| `jobs_followups` | Read `FOLLOW_UPS.md` |
 
-## 8. Scheduling
+## 7. Error handling
 
-07:30 daily scan (and auto-apply if enabled) via an internal loop like the mail watcher; results feed the 08:00 briefing (the briefing text asks the model to call `jobs_list` for postings first seen in the last 24 h with fit ≥ `min_fit_report`, and to report applications made/failed).
+- Chrome not connected → applications stay `queued`; one alert per day telling the user to open Chrome / sign in to the extension.
+- Agent run fails or returns no parseable JSON → `job_runs.ok = false`, posting back to `queued` once, then `error` with detail.
+- Scout finds nothing new → briefing says so; no alert.
+- Budget: each run's `total_cost_usd` is logged; scout and applier have `max_turns` caps.
 
-## 9. Testing
+## 8. Testing
 
-- Unit: each source parser against saved fixture payloads (synthetic, no personal data); filters; de-dup; scoring parse; applicant data generation from a synthetic PROFILE; résumé phone check; Playwright adapters against **local fixture HTML forms** served from a temp dir (Greenhouse/Lever/Ashby-like), including required unknown question → `needs_user`, CAPTCHA element present → stop, submit verification.
-- Live (read-only): fetch real postings from the configured sources and print counts per source; one scoring call.
-- No live submission in tests. The first real application happens only when the user explicitly asks or enables `auto_apply`.
+- Unit: `guard.py` allow/deny matrix (SENSITIVE_IDS denied, writes outside internships denied, résumé readable); scout/applier option builders (tools, cwd, chrome flag, cli_path); JSON result parsing (fenced, prose-wrapped, malformed); scheduler (07:30 once per day, apply window, daily limit, fit threshold, one at a time, Chrome-not-connected path); store methods; tools.
+- Live (manual, cheap): applier smoke run against example.com form-less page (connection check only); scout dry run limited to `max_turns=15` printing the JSON. No real application is submitted by tests.
 
-## 10. Implementation tasks
+## 9. Implementation tasks
 
 | Task | Files |
 |---|---|
-| J1 Sources + filters + store table + config `[jobs]` | `argus/jobs/sources.py`, `argus/jobs/filters.py`, `argus/store.py`, `argus/config.py` |
-| J2 Scoring + applicant data + résumé check | `argus/jobs/scoring.py`, `argus/jobs/applicant.py` |
-| J3 Browser applier (Playwright adapters) | `argus/jobs/applier.py`, `argus/jobs/adapters/*.py` |
-| J4 Scanner loop, tools, briefing, wiring, persona, docs | `argus/jobs/scanner.py`, `argus/tools/jobs.py`, `argus/tools/server.py`, `argus/sdk_session.py`, `argus/main.py`, `argus/mail/watcher.py`, `CLAUDE.md`, `README.md` |
+| J1 Store tables + `[jobs]` config | `argus/store.py`, `argus/config.py` |
+| J2 Guard + scout + applier + result parsing | `argus/jobs/guard.py`, `argus/jobs/scout.py`, `argus/jobs/applier.py` |
+| J3 Scheduler + tools + briefing + wiring + persona + docs | `argus/jobs/scheduler.py`, `argus/tools/jobs.py`, `argus/tools/server.py`, `argus/sdk_session.py`, `argus/main.py`, `argus/mail/watcher.py`, `CLAUDE.md`, `README.md`, `argus.example.toml` |
