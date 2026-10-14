@@ -16,3 +16,4 @@ __pycache__/
 argus.toml
 *.egg-info/
 build/
+.DS_Store
