@@ -484,3 +484,37 @@ async def test_reader_and_pgrep_run_off_the_event_loop_thread(tmp_path):
     assert set(seen) == {"max_id", "inbox_since", "read_body", "mail_running"}
     for name, threads in seen.items():
         assert loop_thread not in threads, name
+
+
+# --- fitness additions to the daily briefing ---
+
+async def _briefing(tmp_path, **kw):
+    env = Env(tmp_path, DAY.replace(hour=7), **kw)
+    await baseline(env)
+    return env
+
+
+async def test_briefing_without_fitness_mentions_no_fitness_tools(tmp_path):
+    env = await _briefing(tmp_path)
+    env.clock.at = DAY.replace(hour=8)
+    await env.watcher.check_once()
+    (b,) = env.briefings()
+    assert "nutrition_status" not in b and "weigh" not in b.lower()
+
+
+async def test_briefing_with_fitness_asks_for_yesterday_and_weigh_in(tmp_path):
+    env = await _briefing(tmp_path, fitness=True)
+    env.clock.at = DAY.replace(hour=8)
+    await env.watcher.check_once()
+    (b,) = env.briefings()
+    assert "nutrition_status" in b and "2026-10-13" in b
+    assert "weigh" in b.lower() and "No weight has been logged" in b
+
+
+async def test_briefing_with_fitness_no_weigh_in_reminder_when_recent_weight(tmp_path):
+    env = await _briefing(tmp_path, fitness=True)
+    env.store.add_weight(DAY.date() - timedelta(days=1), DAY - timedelta(hours=12), 72.0)
+    env.clock.at = DAY.replace(hour=8)
+    await env.watcher.check_once()
+    (b,) = env.briefings()
+    assert "nutrition_status" in b and "No weight has been logged" not in b

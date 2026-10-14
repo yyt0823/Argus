@@ -135,7 +135,8 @@ def build_options(
     resume_id: str | None,
     mail_reader: MailReader | None = None,
 ) -> ClaudeAgentOptions:
-    server, allowed = build_tool_server(store, memory, cfg.db_path, mail_reader)
+    # Fitness tools are registered when cfg.fitness.enabled (build_tools checks it).
+    server, allowed = build_tool_server(store, memory, cfg.db_path, mail_reader, config=cfg)
     persona_path = cfg.root / "CLAUDE.md"
     persona = persona_path.read_text(encoding="utf-8") if persona_path.is_file() else ""
     return ClaudeAgentOptions(

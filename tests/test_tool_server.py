@@ -104,3 +104,21 @@ def test_query_data_describes_mail_triage(env):
     for col in ("mail_id", "account", "received_at", "important", "category", "summary", "action",
                 "deadline", "status", "attempts", "alerted_at", "briefed_at"):
         assert col in d
+
+
+FITNESS_TOOLS = {"fitness_plan", "food_log_add", "food_log_update", "food_log_delete", "nutrition_status",
+                 "weight_log_add", "workout_log_add", "fitness_summary"}
+
+
+async def test_fitness_tools_added_only_when_enabled(tmp_path):
+    from argus.config import Config, FitnessConfig
+    store = Store(tmp_path / "a.db")
+    mem = MemoryStore(tmp_path / "m")
+    base = {"memory_list", "memory_read", "memory_write", "memory_delete", "query_data", "search_history"}
+    on = Config(root=tmp_path, self_handles=("+1",))
+    off = Config(root=tmp_path, self_handles=("+1",), fitness=FitnessConfig(enabled=False))
+    assert {t.name for t in build_tools(store, mem, tmp_path / "a.db", config=on)} == base | FITNESS_TOOLS
+    assert {t.name for t in build_tools(store, mem, tmp_path / "a.db", config=off)} == base
+    _, allowed = build_tool_server(store, mem, tmp_path / "a.db", config=on)
+    assert {f"mcp__argus__{n}" for n in FITNESS_TOOLS} <= set(allowed) and len(allowed) == 14
+    store.close()

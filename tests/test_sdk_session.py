@@ -169,3 +169,19 @@ async def test_interrupt_swallows_plain_exception():
 
 def test_interrupt_timeout_default():
     assert sdk_session_mod.INTERRUPT_TIMEOUT == 5
+
+
+async def test_factory_registers_fitness_tools_when_enabled(tmp_path: Path):
+    from argus.config import FitnessConfig
+    for enabled in (True, False):
+        cfg = Config(root=tmp_path, self_handles=("+15550000000",), fitness=FitnessConfig(enabled=enabled))
+        cfg.data_dir.mkdir(exist_ok=True)
+        store, memory = Store(cfg.db_path), MemoryStore(cfg.memory_dir)
+        made = []
+        def client_cls(options):
+            made.append(FakeClient(options=options)); return made[-1]
+        await make_session_factory(cfg, store, memory, client_cls=client_cls)(None)
+        allowed = made[0].options.allowed_tools
+        assert ("mcp__argus__food_log_add" in allowed) is enabled
+        assert ("mcp__argus__fitness_summary" in allowed) is enabled
+        store.close()

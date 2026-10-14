@@ -48,6 +48,18 @@ BRIEFING_TEXT = (
     "then one line counting the rest; mention emails that could not be analyzed. "
     "Keep it short for a phone."
 )
+# Appended to the briefing when fitness is enabled ({yesterday} is an ISO date).
+FITNESS_BRIEFING_TEXT = (
+    " Then add one line on yesterday's eating: call nutrition_status with day {yesterday} and give "
+    "totals vs budget (kcal and protein) and the most important flag; if nothing was logged, say so "
+    "in a few words."
+)
+WEIGH_IN_TEXT = (
+    " No weight has been logged in the last 2 days: end with a short reminder to weigh in "
+    "(morning, after the toilet, before eating)."
+)
+WEIGH_IN_DAYS = 2
+
 READ_ERROR_TEXT = (
     f"{INTERNAL_PREFIX} Argus could not read the Mail app's data, so new email is not being "
     "checked right now. Tell the user briefly (one short message) and suggest checking that "
@@ -80,6 +92,7 @@ class MailWatcher:
         mail_running: Callable[[], bool] = mail_app_running,
         triage_timeout: float = TRIAGE_TIMEOUT,
         batch_limit: int = BATCH_LIMIT,
+        fitness: bool = False,
     ) -> None:
         self._reader = reader
         self._store = store
@@ -90,6 +103,7 @@ class MailWatcher:
         self._mail_running = mail_running
         self._triage_timeout = triage_timeout
         self._batch_limit = batch_limit
+        self._fitness = fitness
 
     # --- loop ---
 
@@ -194,10 +208,25 @@ class MailWatcher:
         if now.time() < self._cfg.briefing_time or self._store.get_state(KEY_LAST_BRIEFING) == today:
             return
         self._store.set_state(KEY_LAST_BRIEFING, today)  # first: never brief twice
-        await self._submit(BRIEFING_TEXT)
+        await self._submit(self._briefing_text(now))
         rows = self._store.triage_between(now - ALERT_WINDOW, now + timedelta(days=1))
         self._store.mark_briefed([r["mail_id"] for r in rows], now)
         self._store.mark_alerted([r["mail_id"] for r in rows if r["alerted_at"] is None], now)
+
+    def _briefing_text(self, now: datetime) -> str:
+        """The briefing task; with fitness, also yesterday's nutrition line and a weigh-in reminder."""
+        if not self._fitness:
+            return BRIEFING_TEXT
+        today = now.date()
+        text = BRIEFING_TEXT + FITNESS_BRIEFING_TEXT.format(yesterday=(today - timedelta(days=1)).isoformat())
+        try:
+            recent = self._store.weights_between(today - timedelta(days=WEIGH_IN_DAYS), today)
+        except Exception:
+            log.warning("cannot read recent weights for the briefing", exc_info=True)
+            recent = [None]  # unknown: skip the reminder rather than nag wrongly
+        if not recent:
+            text += WEIGH_IN_TEXT
+        return text
 
     async def _alert(self, mail_ids: list[int], now: datetime) -> None:
         rows = []

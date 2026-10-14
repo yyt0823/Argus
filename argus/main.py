@@ -22,6 +22,7 @@ from argus.app import App
 from argus.brain import Brain
 from argus.channel.imessage import IMessageChannel
 from argus.config import Config, load_config
+from argus.fitness.importer import import_markdown_logs
 from argus.mail.reader import MailReader
 from argus.mail.watcher import MailWatcher
 from argus.scheduler import backup, day_key, seconds_until_rollover
@@ -71,6 +72,19 @@ def open_mail_reader(cfg: Config, factory: Callable[[], MailReader] | None = Non
         return None
 
 
+def import_fitness_logs(cfg: Config, store: Store) -> None:
+    """Import ``data/fitness/*.md`` logs into the Store once (idempotent); never raises."""
+    fitness_dir = cfg.data_dir / "fitness"
+    if not cfg.fitness.enabled or not fitness_dir.is_dir():
+        return
+    try:
+        result = import_markdown_logs(store, fitness_dir)
+    except Exception:
+        log.exception("fitness log import failed; continuing without it")
+        return
+    log.info("fitness log import: %s", result)
+
+
 def build_app(cfg: Config, mail_reader_factory: Callable[[], MailReader] | None = None) -> App:
     """Construct every component. Does not start Claude: sessions are created lazily on the first message.
 
@@ -81,6 +95,7 @@ def build_app(cfg: Config, mail_reader_factory: Callable[[], MailReader] | None 
     """
     store = Store(cfg.db_path)
     try:
+        import_fitness_logs(cfg, store)
         memory = MemoryStore(cfg.memory_dir)
         channel = IMessageChannel(cfg.chat_db, cfg.self_handles, store, mode=cfg.mode)
         reader = open_mail_reader(cfg, mail_reader_factory)
@@ -104,7 +119,9 @@ def build_app(cfg: Config, mail_reader_factory: Callable[[], MailReader] | None 
         on_poll_failure=notify,
     )
     app.mail_watcher = (
-        MailWatcher(reader, store, cfg.mail, submit=app.submit_internal) if reader is not None else None
+        MailWatcher(reader, store, cfg.mail, submit=app.submit_internal, fitness=cfg.fitness.enabled)
+        if reader is not None
+        else None
     )
     return app
 

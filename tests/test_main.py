@@ -306,3 +306,89 @@ async def test_serve_without_mail_watcher(tmp_path, monkeypatch):
     await asyncio.sleep(0.05)
     os.kill(os.getpid(), signal.SIGTERM)
     assert await asyncio.wait_for(serve, 5) == 0
+
+
+# --- fitness ---
+
+FOOD_LOG_MD = """# 饮食记录
+
+| 日期 | 训练 | 早餐 | 晚餐 | 全天热量 | 蛋白质 | 备注 |
+|---|---|---|---|---|---|---|
+| 2026-10-10 | A | 燕麦 | 虾 | 约 1500 千卡 | 150 克 | |
+| 2026-10-11 | | 鸡蛋 | 牛肉 | 1400 | 140 | 休息 |
+"""
+
+
+def _fitness_root(tmp_path):
+    d = tmp_path / "data" / "fitness"
+    d.mkdir(parents=True)
+    (d / "food-log.md").write_text(FOOD_LOG_MD, encoding="utf-8")
+    return d
+
+
+def test_build_app_imports_fitness_logs_once(tmp_path, fake_chat_db, caplog):
+    from datetime import date
+    _fitness_root(tmp_path)
+    cfg = Config(root=tmp_path, self_handles=("+15550000000",), chat_db=fake_chat_db.path)
+    caplog.set_level("INFO", logger="argus.main")
+    app = build_app(cfg)
+    try:
+        rows = app.store.foods_between(date(2026, 10, 1), date(2026, 10, 31))
+        assert [(r["day"], r["kcal"], r["protein_g"]) for r in rows] == [
+            ("2026-10-10", 1500, 150), ("2026-10-11", 1400, 140)]
+        assert "food_imported" in caplog.text
+    finally:
+        app.store.close()
+    app = build_app(cfg)  # restart: idempotent
+    try:
+        assert len(app.store.foods_between(date(2026, 10, 1), date(2026, 10, 31))) == 2
+    finally:
+        app.store.close()
+
+
+def test_build_app_skips_fitness_import_when_disabled(tmp_path, fake_chat_db):
+    from datetime import date
+    from argus.config import FitnessConfig
+    _fitness_root(tmp_path)
+    cfg = Config(root=tmp_path, self_handles=("+15550000000",), chat_db=fake_chat_db.path,
+                 fitness=FitnessConfig(enabled=False))
+    app = build_app(cfg)
+    try:
+        assert app.store.foods_between(date(2026, 10, 1), date(2026, 10, 31)) == []
+    finally:
+        app.store.close()
+
+
+def test_build_app_survives_fitness_import_error(tmp_path, fake_chat_db, monkeypatch, caplog):
+    _fitness_root(tmp_path)
+    def boom(store, d):
+        raise RuntimeError("bad markdown")
+    monkeypatch.setattr(main_mod, "import_markdown_logs", boom)
+    cfg = Config(root=tmp_path, self_handles=("+15550000000",), chat_db=fake_chat_db.path)
+    app = build_app(cfg)
+    try:
+        assert "fitness log import failed" in caplog.text
+    finally:
+        app.store.close()
+
+
+def test_build_app_without_fitness_dir_does_not_import(tmp_path, fake_chat_db, monkeypatch):
+    called = []
+    monkeypatch.setattr(main_mod, "import_markdown_logs", lambda *a: called.append(a))
+    cfg = Config(root=tmp_path, self_handles=("+15550000000",), chat_db=fake_chat_db.path)
+    app = build_app(cfg)
+    app.store.close()
+    assert called == []
+
+
+def test_build_app_passes_fitness_flag_to_watcher(tmp_path, fake_chat_db):
+    from argus.config import FitnessConfig
+    fm = build_fake_mail(tmp_path)
+    for enabled in (True, False):
+        cfg = Config(root=tmp_path, self_handles=("+15550000000",), chat_db=fake_chat_db.path,
+                     fitness=FitnessConfig(enabled=enabled))
+        app = build_app(cfg, mail_reader_factory=lambda: MailReader(fm.mail_dir, fm.accounts_db))
+        try:
+            assert app.mail_watcher._fitness is enabled
+        finally:
+            app.store.close()

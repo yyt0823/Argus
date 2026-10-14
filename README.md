@@ -94,6 +94,24 @@ If Mail's data cannot be read at startup, Argus logs a warning and runs without 
 
 Privacy: message bodies are never copied into Argus's database; only the triage result (sender, subject, one-line summary, category, action, deadline) is stored in `data/argus.db` (table `mail_triage`). Bodies are read from Mail's files on demand. Email text sent to Claude for triage or chat stays within your Claude subscription, like your messages.
 
+## Fitness
+
+Text Argus what you eat, your weight and your workouts; it keeps a durable log and tells you what is left of the day's budget.
+
+- "中午吃了虾 200 克、红薯 250 克、蔬菜" → Argus estimates kcal, protein, fat, carbs, added sugar and sodium level, records one entry, and replies with what was logged, today's remaining kcal/protein/fat/carbs and one suggestion for the next meal.
+- Corrections ("刚才那个记错了，虾是 150 克") update or delete the entry; deletes are soft, so nothing is silently lost.
+- "体重 72.4" / "腰围 80" → weight log with 7-day averages; "今天练了 A" → workout log (a logged workout makes the day a training day).
+- "今天还剩多少", "这周怎么样", "上周吃得怎么样" are answered from the recorded data. All totals and remaining values are computed by Argus's code, not by the model.
+- With mail enabled, the 08:00 briefing adds one line on yesterday's eating and a weigh-in reminder if no weight was logged in the last 2 days.
+
+Setup (all optional):
+
+1. Write your plan as Markdown at `data/fitness/CLAUDE.md` (body data, budgets, a food reference table, likes/dislikes, training plan). Argus reads it through a tool, so edits apply immediately. Without it Argus uses typical nutrition values.
+2. Put your budgets in the `[fitness]` table of `argus.toml` (see `argus.example.toml`; the defaults are generic placeholders): `training_days`, `training_kcal`, `rest_kcal`, `min_kcal`, `protein_g`, `carbs_g`, `fat_g`, `added_sugar_g_max`. Set `enabled = false` to turn fitness off.
+3. Existing logs in `data/fitness/food-log.md` and `data/fitness/weight-log.md` are imported at startup (idempotent; each imported day is skipped on later starts).
+
+Days follow Argus's 04:00 rollover, so a 01:00 snack counts for the previous day. Data lives in `data/argus.db` (tables `food_log`, `weight_log`, `workout_log`).
+
 ## Where data lives
 
 Everything personal stays on the Mac and is git-ignored:

@@ -45,3 +45,19 @@ self_handles = ["+15550000000"]
 # quiet_end = "08:00"             #   those emails go into the next briefing
 # check_interval_minutes = 5      # how often new mail is checked
 # triage_model = "haiku"          # model for the one-shot, tool-less importance check per email
+
+# --- Fitness and food log (optional) ---
+# Food / weight / workout logging through chat, with daily budgets. Put your own numbers in argus.toml.
+# All keys optional; generic defaults shown.
+# [fitness]
+# enabled = true                     # false: no fitness tools, no briefing line, no import
+# plan_path = "data/fitness/CLAUDE.md"   # your plan (Markdown), read by the fitness_plan tool
+# training_days = ["mon", "wed", "fri"]  # used when no workout is logged for a day
+# training_kcal = 2000               # daily kcal budget on training days
+# rest_kcal = 1800                   # daily kcal budget on rest days
+# min_kcal = 1200                    # flag days below this
+# protein_g = [100, 150]             # [low, high] grams per day
+# carbs_g = [150, 250]
+# fat_g = [50, 70]
+# added_sugar_g_max = 25
+# sodium_mg_max = 2300
