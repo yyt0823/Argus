@@ -185,3 +185,20 @@ async def test_factory_registers_fitness_tools_when_enabled(tmp_path: Path):
         assert ("mcp__argus__food_log_add" in allowed) is enabled
         assert ("mcp__argus__fitness_summary" in allowed) is enabled
         store.close()
+
+
+async def test_factory_registers_jobs_tools_with_scheduler(tmp_path: Path):
+    from argus.jobs.scheduler import JobScheduler
+    cfg = Config(root=tmp_path, self_handles=("+15550000000",))
+    cfg.data_dir.mkdir(exist_ok=True)
+    store, memory = Store(cfg.db_path), MemoryStore(cfg.memory_dir)
+    sched = JobScheduler(cfg, store, submit=None)
+    for kwargs, expected in (({}, False), ({"job_scheduler": sched}, True)):
+        made = []
+        def client_cls(options):
+            made.append(FakeClient(options=options)); return made[-1]
+        await make_session_factory(cfg, store, memory, client_cls=client_cls, **kwargs)(None)
+        allowed = made[0].options.allowed_tools
+        assert ("mcp__argus__jobs_scout_now" in allowed) is expected
+        assert ("mcp__argus__job_apply" in allowed) is expected
+    store.close()

@@ -23,6 +23,7 @@ from argus.brain import Brain
 from argus.channel.imessage import IMessageChannel
 from argus.config import Config, load_config
 from argus.fitness.importer import import_markdown_logs
+from argus.jobs.scheduler import JobScheduler
 from argus.mail.reader import MailReader
 from argus.mail.watcher import MailWatcher
 from argus.scheduler import backup, day_key, seconds_until_rollover
@@ -85,6 +86,17 @@ def import_fitness_logs(cfg: Config, store: Store) -> None:
     log.info("fitness log import: %s", result)
 
 
+def make_job_scheduler(cfg: Config, store: Store) -> JobScheduler | None:
+    """The internship scheduler, or None when ``[jobs]`` is disabled. ``submit`` is set by
+    ``build_app`` once the App exists."""
+    if not cfg.jobs.enabled:
+        return None
+    if not cfg.jobs_internships_dir.is_dir():
+        log.warning("jobs: internships directory %s not found; searches will fail until it exists",
+                    cfg.jobs_internships_dir)
+    return JobScheduler(cfg, store, submit=None)
+
+
 def build_app(cfg: Config, mail_reader_factory: Callable[[], MailReader] | None = None) -> App:
     """Construct every component. Does not start Claude: sessions are created lazily on the first message.
 
@@ -99,11 +111,12 @@ def build_app(cfg: Config, mail_reader_factory: Callable[[], MailReader] | None 
         memory = MemoryStore(cfg.memory_dir)
         channel = IMessageChannel(cfg.chat_db, cfg.self_handles, store, mode=cfg.mode)
         reader = open_mail_reader(cfg, mail_reader_factory)
+        scheduler = make_job_scheduler(cfg, store)
         # Backups are driven by backup_loop(), not by Brain's rollover hook, because the hook
         # only fires when a message arrives after the rollover hour.
         brain = Brain(
             store,
-            make_session_factory(cfg, store, memory, mail_reader=reader),
+            make_session_factory(cfg, store, memory, mail_reader=reader, job_scheduler=scheduler),
             rollover_hour=cfg.rollover_hour,
             on_rollover=None,
         )
@@ -118,8 +131,12 @@ def build_app(cfg: Config, mail_reader_factory: Callable[[], MailReader] | None 
         slow_notice_seconds=cfg.slow_notice_seconds,
         on_poll_failure=notify,
     )
+    if scheduler is not None:
+        scheduler.submit = app.submit_internal  # the App exists only now
+    app.job_scheduler = scheduler
     app.mail_watcher = (
-        MailWatcher(reader, store, cfg.mail, submit=app.submit_internal, fitness=cfg.fitness.enabled)
+        MailWatcher(reader, store, cfg.mail, submit=app.submit_internal, fitness=cfg.fitness.enabled,
+                    jobs=scheduler is not None)
         if reader is not None
         else None
     )
@@ -157,7 +174,8 @@ def notify(message: str) -> None:
 
 
 async def _serve(cfg: Config, app: App) -> int:
-    """Run the app, the backup loop and (if enabled) the mail watcher until SIGTERM/SIGINT.
+    """Run the app, the backup loop and (if enabled) the mail watcher and the job scheduler until
+    SIGTERM/SIGINT.
     Returns the exit code."""
     loop = asyncio.get_running_loop()
     stop = asyncio.Event()
@@ -172,6 +190,11 @@ async def _serve(cfg: Config, app: App) -> int:
     if watcher is not None:
         # MailWatcher.run() logs and survives failed checks, so it only ends when cancelled.
         tasks.append(asyncio.create_task(watcher.run(), name="argus-mail"))
+    scheduler = getattr(app, "job_scheduler", None)
+    if scheduler is not None:
+        # JobScheduler.run() logs and survives failed ticks; cancelling it also cancels a running
+        # search or application.
+        tasks.append(asyncio.create_task(scheduler.run(), name="argus-jobs"))
     log.info("Argus started (root=%s)", cfg.root)
     try:
         await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)

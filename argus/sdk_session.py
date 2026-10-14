@@ -23,6 +23,7 @@ from argus.tools.memory import MemoryStore
 from argus.tools.server import build_tool_server
 
 if TYPE_CHECKING:
+    from argus.jobs.scheduler import JobScheduler
     from argus.mail.reader import MailReader
 
 log = logging.getLogger(__name__)
@@ -134,9 +135,13 @@ def build_options(
     memory: MemoryStore,
     resume_id: str | None,
     mail_reader: MailReader | None = None,
+    job_scheduler: JobScheduler | None = None,
 ) -> ClaudeAgentOptions:
-    # Fitness tools are registered when cfg.fitness.enabled (build_tools checks it).
-    server, allowed = build_tool_server(store, memory, cfg.db_path, mail_reader, config=cfg)
+    # Fitness tools are registered when cfg.fitness.enabled, jobs tools when cfg.jobs.enabled and a
+    # scheduler is given (build_tools checks both).
+    server, allowed = build_tool_server(
+        store, memory, cfg.db_path, mail_reader, config=cfg, job_scheduler=job_scheduler
+    )
     persona_path = cfg.root / "CLAUDE.md"
     persona = persona_path.read_text(encoding="utf-8") if persona_path.is_file() else ""
     return ClaudeAgentOptions(
@@ -160,11 +165,12 @@ def make_session_factory(
     memory: MemoryStore,
     mail_reader: MailReader | None = None,
     client_cls: Any = ClaudeSDKClient,
+    job_scheduler: JobScheduler | None = None,
 ) -> SessionFactory:
     """Return ``factory(resume_id)`` that builds options and returns a started ``SDKSession``."""
 
     async def factory(resume_id: str | None) -> SDKSession:
-        options = build_options(cfg, store, memory, resume_id, mail_reader)
+        options = build_options(cfg, store, memory, resume_id, mail_reader, job_scheduler)
         session = SDKSession(options, client=client_cls(options=options))
         await session.start()
         return session

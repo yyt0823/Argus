@@ -518,3 +518,23 @@ async def test_briefing_with_fitness_no_weigh_in_reminder_when_recent_weight(tmp
     await env.watcher.check_once()
     (b,) = env.briefings()
     assert "nutrition_status" in b and "No weight has been logged" not in b
+
+
+# --- jobs additions to the daily briefing ---
+
+async def test_briefing_without_jobs_mentions_no_jobs_tools(tmp_path):
+    env = await _briefing(tmp_path)
+    env.clock.at = DAY.replace(hour=8)
+    await env.watcher.check_once()
+    (b,) = env.briefings()
+    assert "jobs_list" not in b
+
+
+async def test_briefing_with_jobs_asks_for_postings_and_applications(tmp_path):
+    env = await _briefing(tmp_path, jobs=True)
+    env.clock.at = DAY.replace(hour=8)
+    await env.watcher.check_once()
+    (b,) = env.briefings()
+    assert "jobs_list" in b and "fit" in b.lower()
+    for status in ("submitted", "needs_login", "needs_attestation"):
+        assert status in b

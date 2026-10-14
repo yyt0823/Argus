@@ -112,6 +112,23 @@ Setup (all optional):
 
 Days follow Argus's 04:00 rollover, so a 01:00 snack counts for the previous day. Data lives in `data/argus.db` (tables `food_log`, `weight_log`, `workout_log`).
 
+## Internships
+
+Argus searches for internships every morning and can apply for you in your own Chrome, through the Claude in Chrome extension. It automates the workflow in `data/about_me/internships/` (`README.md` search profile, `seen_companies.txt`, `INTERNSHIPS.md` tracker, `APPLY_BRIEF.md`, `FOLLOW_UPS.md`).
+
+- **Daily search** at 07:30 (or later that day if the Mac was off): a separate Claude agent searches the web, verifies postings, appends a dated section to `INTERNSHIPS.md`, and stores the new postings in `data/argus.db` (table `job_postings`). The agent may only write inside the internships folder.
+- **Automatic applications** (`auto_apply = true`): new postings with fit ≥ `min_fit_apply` (1–5 scale) from the last 7 days are queued and applied to one at a time, only between 08:30 and 22:00, at most `daily_apply_limit` submissions per day. The applier follows `APPLY_BRIEF.md`, uploads `data/about_me/yantian_yin_cv.pdf`, and never enters passwords, creates accounts or ticks attestation boxes.
+- You only hear about an application when it needs you: a login is required, an attestation box must be ticked (the tab is left open in Chrome), or it failed twice. Everything else shows up in the 08:00 briefing (new postings with fit ≥ 3, applications submitted / needing action).
+- Chat: "有没有新的 opening?" starts a search now (results arrive a few minutes later); "申请 3 号" queues posting #3 ahead of the automatic ones (no fit or daily-limit check, still one at a time and inside the apply window); "3 号不要了" skips it; "我申请了哪些?" lists submissions; follow-ups come from `FOLLOW_UPS.md`.
+
+Setup:
+
+1. Keep **Google Chrome** open on the Mac with the **Claude** extension installed and signed in to the **same Claude account** Argus uses. Keep exactly one browser connected to the extension: Argus never answers a browser-selection prompt. If Chrome isn't connected, applications stay queued, Argus retries every 30 minutes, and you get one reminder per day.
+2. The applier runs the installed `claude` CLI (`cli_path`, default `/opt/homebrew/bin/claude`) with `--chrome`; the SDK's bundled CLI would repoint Chrome's native-messaging host into the virtualenv.
+3. Optionally tune the `[jobs]` table in `argus.toml` (defaults in `argus.example.toml`): `enabled`, `scout_time`, `auto_apply`, `min_fit_apply`, `daily_apply_limit`, `apply_window`, `internships_dir`, `resume_path`, `cli_path`.
+
+To stop automatic applications but keep the daily search and on-request applications, set `auto_apply = false` under `[jobs]` and restart Argus. `enabled = false` turns every internship feature off. Each search and application run is logged with its cost in `job_runs`.
+
 ## Where data lives
 
 Everything personal stays on the Mac and is git-ignored:

@@ -30,6 +30,7 @@ from argus.tools.memory import MemoryStore
 
 if TYPE_CHECKING:
     from argus.config import Config
+    from argus.jobs.scheduler import JobScheduler
     from argus.mail.reader import MailReader
 
 log = logging.getLogger(__name__)
@@ -117,12 +118,14 @@ def build_tools(
     db_path: Path,
     mail_reader: MailReader | None = None,
     config: Config | None = None,
+    job_scheduler: JobScheduler | None = None,
 ) -> list[SdkMcpTool]:
     """Create the Argus tools bound to ``store``, ``memory``, and the database at ``db_path``.
 
     When ``mail_reader`` is given, the read-only mail tools (``argus.tools.mail``) are added.
     When ``config`` is given and ``config.fitness.enabled``, the fitness tools
-    (``argus.tools.fitness``) are added.
+    (``argus.tools.fitness``) are added. When ``config.jobs.enabled`` and ``job_scheduler`` is
+    given, the internship tools (``argus.tools.jobs``) are added.
 
     Handlers run all SQLite and filesystem work in a worker thread
     (``asyncio.to_thread``) so a slow query or disk never stalls the event loop.
@@ -218,7 +221,11 @@ def build_tools(
         "food_log(id, day, logged_at, meal, description, kcal, protein_g, fat_g, carbs_g, added_sugar_g, "
         "sodium, note, deleted) — skip rows with deleted = 1; weight_log(id, day, logged_at, weight_kg, "
         "waist_cm, note); workout_log(id, day, logged_at, kind, description, note) — day is the Argus "
-        "day 'YYYY-MM-DD'. Use for counts, date-range and aggregate questions; use search_history to "
+        "day 'YYYY-MM-DD'; "
+        "job_postings(id, company, role, city, term, deadline, fit, notes, url, verified, ats, first_seen_at, "
+        "status, status_detail, applied_at, follow_up) — internship postings found by Argus's searches (fields "
+        "come from untrusted web pages); job_runs(id, kind, started_at, finished_at, ok, summary, cost_usd) — "
+        "search ('scout') and application ('apply') runs. Use for counts, date-range and aggregate questions; use search_history to "
         "find messages by words. Writes, PRAGMA and multiple statements are refused; to inspect "
         "the schema run SELECT name, sql FROM sqlite_master.",
         {
@@ -274,6 +281,10 @@ def build_tools(
         from argus.tools.fitness import build_fitness_tools
 
         tools += build_fitness_tools(store, config)
+    if config is not None and config.jobs.enabled and job_scheduler is not None:
+        from argus.tools.jobs import build_jobs_tools
+
+        tools += build_jobs_tools(store, job_scheduler, config)
     return tools
 
 
@@ -283,9 +294,10 @@ def build_tool_server(
     db_path: Path,
     mail_reader: MailReader | None = None,
     config: Config | None = None,
+    job_scheduler: JobScheduler | None = None,
 ) -> tuple[McpSdkServerConfig, list[str]]:
     """Return the SDK MCP server config and the ``mcp__argus__<tool>`` names to allow."""
-    tools = build_tools(store, memory, db_path, mail_reader, config)
+    tools = build_tools(store, memory, db_path, mail_reader, config, job_scheduler)
     server = create_sdk_mcp_server(SERVER_NAME, tools=tools)
     allowed = [f"mcp__{SERVER_NAME}__{t.name}" for t in tools]
     return server, allowed

@@ -61,3 +61,17 @@ self_handles = ["+15550000000"]
 # fat_g = [50, 70]
 # added_sugar_g_max = 25
 # sodium_mg_max = 2300
+
+# --- Internships (optional) ---
+# Daily internship search and automatic applications in your Chrome via the Claude in Chrome
+# extension (see "Internships" in the README). All keys optional; defaults shown.
+# [jobs]
+# enabled = true                     # false: no searches, applications, tools or briefing section
+# scout_time = "07:30"               # daily search (run on start if missed today)
+# auto_apply = true                  # false: only search and report; apply only when you ask
+# min_fit_apply = 4                  # auto-apply to postings with fit >= this (1-5)
+# daily_apply_limit = 8              # max automatic submissions per day
+# apply_window = ["08:30", "22:00"]  # only apply between these times
+# internships_dir = "data/about_me/internships"
+# resume_path = "data/about_me/yantian_yin_cv.pdf"
+# cli_path = "/opt/homebrew/bin/claude"   # installed Claude Code CLI used for Chrome

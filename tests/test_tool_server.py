@@ -122,3 +122,30 @@ async def test_fitness_tools_added_only_when_enabled(tmp_path):
     _, allowed = build_tool_server(store, mem, tmp_path / "a.db", config=on)
     assert {f"mcp__argus__{n}" for n in FITNESS_TOOLS} <= set(allowed) and len(allowed) == 14
     store.close()
+
+
+JOBS_TOOLS = {"jobs_scout_now", "jobs_list", "job_apply", "job_skip", "jobs_followups"}
+
+
+async def test_jobs_tools_added_only_with_scheduler_and_enabled(tmp_path):
+    from argus.config import Config, FitnessConfig, JobsConfig
+    from argus.jobs.scheduler import JobScheduler
+    store = Store(tmp_path / "a.db")
+    mem = MemoryStore(tmp_path / "m")
+    on = Config(root=tmp_path, self_handles=("+1",), fitness=FitnessConfig(enabled=False))
+    off = Config(root=tmp_path, self_handles=("+1",), fitness=FitnessConfig(enabled=False),
+                 jobs=JobsConfig(enabled=False))
+    sched = JobScheduler(on, store, submit=None)
+    names = lambda **kw: {t.name for t in build_tools(store, mem, tmp_path / "a.db", **kw)}
+    assert names(config=on, job_scheduler=sched) >= JOBS_TOOLS
+    assert not names(config=on) & JOBS_TOOLS
+    assert not names(config=off, job_scheduler=sched) & JOBS_TOOLS
+    _, allowed = build_tool_server(store, mem, tmp_path / "a.db", config=on, job_scheduler=sched)
+    assert {f"mcp__argus__{n}" for n in JOBS_TOOLS} <= set(allowed)
+    store.close()
+
+
+def test_query_data_describes_job_tables(env):
+    _, _, t = env
+    d = t["query_data"].description
+    assert "job_postings(" in d and "job_runs(" in d

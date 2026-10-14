@@ -59,6 +59,14 @@ WEIGH_IN_TEXT = (
     "(morning, after the toilet, before eating)."
 )
 WEIGH_IN_DAYS = 2
+# Appended to the briefing when the internship features are enabled.
+JOBS_BRIEFING_TEXT = (
+    " Then add a short internships section: call jobs_list with days 1 and min_fit 3 for new postings "
+    "found in the last 24 hours (best first, with deadlines; if none, say no new openings were found), "
+    "jobs_list with status submitted and days 1 for applications submitted since yesterday, and jobs_list "
+    "with status needs_login, then needs_attestation, then error for applications that need the user "
+    "(with links). Never say an application was submitted unless jobs_list shows status submitted."
+)
 
 READ_ERROR_TEXT = (
     f"{INTERNAL_PREFIX} Argus could not read the Mail app's data, so new email is not being "
@@ -93,6 +101,7 @@ class MailWatcher:
         triage_timeout: float = TRIAGE_TIMEOUT,
         batch_limit: int = BATCH_LIMIT,
         fitness: bool = False,
+        jobs: bool = False,
     ) -> None:
         self._reader = reader
         self._store = store
@@ -104,6 +113,7 @@ class MailWatcher:
         self._triage_timeout = triage_timeout
         self._batch_limit = batch_limit
         self._fitness = fitness
+        self._jobs = jobs
 
     # --- loop ---
 
@@ -214,9 +224,14 @@ class MailWatcher:
         self._store.mark_alerted([r["mail_id"] for r in rows if r["alerted_at"] is None], now)
 
     def _briefing_text(self, now: datetime) -> str:
-        """The briefing task; with fitness, also yesterday's nutrition line and a weigh-in reminder."""
-        if not self._fitness:
-            return BRIEFING_TEXT
+        """The briefing task; with fitness, also yesterday's nutrition line and a weigh-in reminder;
+        with jobs, also an internships section."""
+        text = self._fitness_text(now) if self._fitness else BRIEFING_TEXT
+        if self._jobs:
+            text += JOBS_BRIEFING_TEXT
+        return text
+
+    def _fitness_text(self, now: datetime) -> str:
         today = now.date()
         text = BRIEFING_TEXT + FITNESS_BRIEFING_TEXT.format(yesterday=(today - timedelta(days=1)).isoformat())
         try:

@@ -392,3 +392,70 @@ def test_build_app_passes_fitness_flag_to_watcher(tmp_path, fake_chat_db):
             assert app.mail_watcher._fitness is enabled
         finally:
             app.store.close()
+
+
+# --- jobs wiring ---
+
+
+def test_build_app_wires_job_scheduler(tmp_path, fake_chat_db, monkeypatch):
+    from argus.jobs.scheduler import JobScheduler
+    calls = _record_session_factory(monkeypatch)
+    cfg = Config(root=tmp_path, self_handles=("+15550000000",), chat_db=fake_chat_db.path)
+    app = build_app(cfg)
+    try:
+        sched = app.job_scheduler
+        assert isinstance(sched, JobScheduler)
+        assert calls[0]["job_scheduler"] is sched
+        assert sched.submit == app.submit_internal
+        assert sched._store is app.store and sched._cfg is cfg
+    finally:
+        app.store.close()
+
+
+def test_build_app_without_jobs_when_disabled(tmp_path, fake_chat_db, monkeypatch):
+    from argus.config import JobsConfig
+    calls = _record_session_factory(monkeypatch)
+    cfg = Config(root=tmp_path, self_handles=("+15550000000",), chat_db=fake_chat_db.path,
+                 jobs=JobsConfig(enabled=False))
+    app = build_app(cfg)
+    try:
+        assert app.job_scheduler is None
+        assert calls[0]["job_scheduler"] is None
+    finally:
+        app.store.close()
+
+
+def test_build_app_briefing_includes_jobs_when_enabled(tmp_path, fake_chat_db):
+    from argus.config import JobsConfig
+    fm = build_fake_mail(tmp_path)
+    for enabled in (True, False):
+        cfg = Config(root=tmp_path, self_handles=("+15550000000",), chat_db=fake_chat_db.path,
+                     jobs=JobsConfig(enabled=enabled))
+        app = build_app(cfg, mail_reader_factory=lambda: MailReader(fm.mail_dir, fm.accounts_db))
+        try:
+            assert app.mail_watcher._jobs is enabled
+        finally:
+            app.store.close()
+
+
+class _JobsApp(_IdleApp):
+    def __init__(self, scheduler):
+        super().__init__(None)
+        self.job_scheduler = scheduler
+
+
+async def test_serve_runs_and_cancels_job_scheduler(tmp_path, monkeypatch):
+    import os
+    import signal
+
+    async def idle_backup(cfg):
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(main_mod, "backup_loop", idle_backup)
+    cfg = Config(root=tmp_path, self_handles=("+15550000000",), chat_db=tmp_path / "chat.db")
+    sched = _FakeWatcher()  # same run()/cancel contract
+    serve = asyncio.create_task(main_mod._serve(cfg, _JobsApp(sched)))
+    await asyncio.wait_for(sched.started.wait(), 5)
+    os.kill(os.getpid(), signal.SIGTERM)
+    assert await asyncio.wait_for(serve, 5) == 0
+    assert sched.cancelled
