@@ -6,7 +6,7 @@
 #             and Argus replies in that conversation. See "Dedicated Apple ID" in the README.
 #   "self"    (default): your own Apple ID. You text yourself; Argus answers in the self-chat.
 #             Every message appears twice on the iPhone (sent + received copy).
-mode = "contact"
+mode = "self"
 
 # Required: iMessage handles (phone number in E.164 form and/or Apple ID email).
 #   mode = "contact": YOUR handles, i.e. what your iPhone sends from when you text the bot
