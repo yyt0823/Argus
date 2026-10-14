@@ -216,3 +216,30 @@ async def test_rollover_after_failed_session_still_ends_old_day(store):
     assert rolled == [date(2026, 10, 2)]
     assert store.get_session(date(2026, 10, 1))["ended_at"] is not None
     assert [e for e in log if e[0] == "new"][-1] == ("new", None)
+
+
+# --- internal tasks (sender="system") ---
+
+async def test_internal_task_archived_as_system(store):
+    log = []
+    b = Brain(store, factory(log), now=Clock(datetime(2026, 10, 1, 9)))
+    reply = await b.ask("[Argus internal task — not from the user] brief", sender="system")
+    assert reply == "re:[2026-10-01 09:00] [Argus internal task — not from the user] brief"
+    assert [h["sender"] for h in store.search_messages("brief")] == ["argus", "system"]
+
+
+async def test_sender_is_forwarded_to_store_and_defaults_to_user(tmp_path):
+    class Recording(Store):
+        def __init__(self, path):
+            super().__init__(path); self.senders = []
+        def add_message(self, sender, content, ts, session_id=None):
+            self.senders.append(sender)
+            return super().add_message(sender, content, ts, session_id=session_id)
+    s = Recording(tmp_path / "r.db")
+    try:
+        b = Brain(s, factory([]), now=Clock(datetime(2026, 10, 1, 9)))
+        await b.ask("task", sender="system")
+        await b.ask("hello")
+        assert s.senders == ["system", "argus", "user", "argus"]
+    finally:
+        s.close()

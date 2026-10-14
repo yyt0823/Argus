@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 from datetime import date, datetime
-from typing import Awaitable, Callable
+from typing import Awaitable, Callable, Literal
 
 from argus.scheduler import day_key
 from argus.session import Interrupted, Session, SessionError, SessionFactory
@@ -34,11 +34,17 @@ class Brain:
         self._asking = False
         self._pending_interrupt = False
 
-    async def ask(self, text: str, at: datetime | None = None) -> str:
-        """Answer one user message. ``at`` is when it was sent (default: now).
+    async def ask(
+        self,
+        text: str,
+        at: datetime | None = None,
+        sender: Literal["user", "system"] = "user",
+    ) -> str:
+        """Answer one incoming message. ``at`` is when it was sent (default: now).
 
         The session is chosen by the current time; ``at`` stamps the message for Claude
-        and timestamps the archived user message.
+        and timestamps the archived incoming message. ``sender`` is ``"system"`` for
+        Argus's own internal tasks, which are archived as such instead of as the user.
         """
         if at is None:
             at = self._now()
@@ -47,7 +53,7 @@ class Brain:
         try:
             session = await self._ensure_session()
             row_id = self._row_id
-            self._store.add_message("user", text, at, session_id=row_id)
+            self._store.add_message(sender, text, at, session_id=row_id)
             if self._pending_interrupt:
                 # Stop arrived while the session was still being created.
                 self._pending_interrupt = False

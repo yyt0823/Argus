@@ -1,4 +1,10 @@
-"""App loop: poll the channel, route stop/retry words, feed a single worker that talks to the brain."""
+"""App loop: poll the channel, route stop/retry words, feed a single worker that talks to the brain.
+
+Besides user messages, the worker runs Argus's own internal tasks (``submit_internal``), e.g. mail
+alerts and briefings. They share the FIFO queue and the day's session, are archived with sender
+``system``, and their reply goes to the user like any other; but they never touch the pending queue
+or the retry list, get no slow notice, and send nothing when they fail.
+"""
 
 from __future__ import annotations
 
@@ -8,7 +14,8 @@ import json
 import logging
 import time
 from datetime import datetime
-from typing import Callable, Protocol
+from dataclasses import dataclass
+from typing import Callable, Literal, Protocol
 
 from argus.channel.base import Channel, IncomingMessage, SendError
 from argus.session import Interrupted, SessionError
@@ -28,11 +35,19 @@ MAX_FAILED = 20
 
 
 class BrainLike(Protocol):
-    async def ask(self, text: str, at: datetime | None = None) -> str: ...
+    async def ask(
+        self, text: str, at: datetime | None = None, sender: Literal["user", "system"] = "user"
+    ) -> str: ...
 
     async def interrupt(self) -> None: ...
 
     async def close(self) -> None: ...
+
+
+@dataclass(frozen=True)
+class _Job:
+    msg: IncomingMessage
+    internal: bool = False
 
 
 class App:
@@ -55,11 +70,12 @@ class App:
         self.on_poll_failure = on_poll_failure
         self.poll_failure_notify_after = poll_failure_notify_after
         self.poll_error_log_interval = poll_error_log_interval
-        self._queue: asyncio.Queue[IncomingMessage] = asyncio.Queue()
+        self._queue: asyncio.Queue[_Job] = asyncio.Queue()
         # True while the worker is inside brain.ask(); the only time 停 should interrupt.
         self._asking = False
         self._worker_task: asyncio.Task | None = None
         self._retry_seq = 0
+        self._internal_seq = 0
         # Poll-failure bookkeeping (rate-limited logging, one notification per outage).
         self._poll_failures = 0
         self._last_poll_log = 0.0
@@ -92,17 +108,28 @@ class App:
                 for text in failed:
                     self._retry_seq += 1
                     self._queue.put_nowait(
-                        IncomingMessage(
-                            id=f"retry-{self._retry_seq}-{now.timestamp():.6f}",
-                            text=text,
-                            received_at=now,
+                        _Job(
+                            IncomingMessage(
+                                id=f"retry-{self._retry_seq}-{now.timestamp():.6f}",
+                                text=text,
+                                received_at=now,
+                            )
                         )
                     )
             else:
                 await self._send(NOTHING_TO_RETRY)
             self._forget(msg)
         else:
-            self._queue.put_nowait(msg)
+            self._queue.put_nowait(_Job(msg))
+
+    async def submit_internal(self, text: str) -> None:
+        """Queue an Argus-generated task (e.g. a mail alert); its reply is sent to the user."""
+        self._internal_seq += 1
+        now = datetime.now()
+        msg = IncomingMessage(
+            id=f"internal-{self._internal_seq}-{now.timestamp():.6f}", text=text, received_at=now
+        )
+        self._queue.put_nowait(_Job(msg, internal=True))
 
     def _forget(self, msg: IncomingMessage) -> None:
         """Drop a fully handled message from the persistent pending queue."""
@@ -208,13 +235,17 @@ class App:
     async def _worker(self) -> None:
         try:
             while True:
-                msg = await self._queue.get()
+                job = await self._queue.get()
                 try:
-                    await self._handle(msg)
+                    if job.internal:
+                        await self._handle_internal(job.msg)
+                    else:
+                        await self._handle(job.msg)
                 except Exception:
                     log.exception("worker failed handling a message")
-                    self._record_failure(msg.text)
-                    self._forget(msg)
+                    if not job.internal:
+                        self._record_failure(job.msg.text)
+                        self._forget(job.msg)
                 finally:
                     self._queue.task_done()
         finally:
@@ -259,6 +290,22 @@ class App:
                     await timer
         await self._send(reply)
         self._forget(msg)
+
+    async def _handle_internal(self, msg: IncomingMessage) -> None:
+        self._asking = True
+        try:
+            reply = await self.brain.ask(msg.text, msg.received_at, sender="system")
+        except Interrupted:
+            reply = STOPPED_REPLY
+        except SessionError as e:
+            log.warning("internal task failed (session error): %s", e)
+            return
+        except Exception:
+            log.exception("internal task failed")
+            return
+        finally:
+            self._asking = False
+        await self._send(reply)
 
     async def _send(self, text: str) -> None:
         try:
