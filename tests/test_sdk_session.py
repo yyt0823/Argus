@@ -202,3 +202,9 @@ async def test_factory_registers_jobs_tools_with_scheduler(tmp_path: Path):
         assert ("mcp__argus__jobs_scout_now" in allowed) is expected
         assert ("mcp__argus__job_apply" in allowed) is expected
     store.close()
+
+
+def test_system_prompt_explains_day_boundary():
+    p = build_system_prompt("You are Argus.", "", datetime(2026, 10, 13, 2, 30))
+    now_section = p.split("# Now", 1)[1]
+    assert "04:00" in now_section and "今天" in now_section and "previous calendar date" in now_section

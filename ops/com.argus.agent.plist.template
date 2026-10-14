@@ -31,6 +31,10 @@
         <key>HOME</key>
         <string>__HOME__</string>
     </dict>
+    <!-- On stop, Argus lets the reply in progress finish (up to 45 s) before exiting; launchd
+         would otherwise SIGKILL it after its default 20 s. -->
+    <key>ExitTimeOut</key>
+    <integer>60</integer>
     <key>ThrottleInterval</key>
     <integer>10</integer>
     <key>StandardOutPath</key>

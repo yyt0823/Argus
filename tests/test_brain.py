@@ -243,3 +243,96 @@ async def test_sender_is_forwarded_to_store_and_defaults_to_user(tmp_path):
         assert s.senders == ["system", "argus", "user", "argus"]
     finally:
         s.close()
+
+
+# --- reliability fixes: timeout, forced interrupt, turn context, replay, empty reply ---
+from argus import turn_context
+
+
+class Hanging(FakeSession):
+    """A session whose ask never returns unless released; interrupt is ignored."""
+    async def ask(self, text):
+        self.log.append(("ask", self.resume, text))
+        await asyncio.Event().wait()
+
+
+async def test_ask_timeout_discards_session_and_raises(store):
+    log, made = [], []
+    async def f(resume):
+        made.append(Hanging(resume, log)); return made[-1]
+    b = Brain(store, f, now=Clock(datetime(2026, 10, 1, 9)), ask_timeout=0.05)
+    with pytest.raises(SessionError, match="回复超时"):
+        await b.ask("slow")
+    assert made[0].closed
+    # next ask builds a new session
+    with pytest.raises(SessionError):
+        await b.ask("again")
+    assert len(made) == 2
+
+
+async def test_interrupt_forces_discard_after_grace(store):
+    log, made = [], []
+    async def f(resume):
+        made.append(Hanging(resume, log)); return made[-1]
+    b = Brain(store, f, now=Clock(datetime(2026, 10, 1, 9)), interrupt_grace=0.05)
+    task = asyncio.create_task(b.ask("stuck"))
+    await asyncio.sleep(0.02)
+    await b.interrupt()
+    with pytest.raises(Interrupted):
+        await asyncio.wait_for(task, 2)
+    assert ("interrupt",) in log and made[0].closed
+    assert b._session is None
+
+
+async def test_interrupt_that_works_keeps_session(store):
+    class Stoppable(FakeSession):
+        async def ask(self, text):
+            self._ev = asyncio.Event(); await self._ev.wait(); raise Interrupted()
+        async def interrupt(self): self._ev.set()
+    made = []
+    async def f(resume):
+        made.append(Stoppable(resume, [])); return made[-1]
+    b = Brain(store, f, now=Clock(datetime(2026, 10, 1, 9)), interrupt_grace=0.05)
+    task = asyncio.create_task(b.ask("x")); await asyncio.sleep(0.01)
+    await b.interrupt()
+    with pytest.raises(Interrupted):
+        await task
+    await asyncio.sleep(0.1)  # past the grace: must not fire later
+    assert not made[0].closed and b._session is made[0]
+
+
+async def test_turn_context_set_during_session_ask(store):
+    seen = []
+    class Peek(FakeSession):
+        async def ask(self, text):
+            seen.append((turn_context.is_system_turn(), turn_context.message_time()))
+            return "ok"
+    async def f(resume): return Peek(resume, [])
+    b = Brain(store, f, now=Clock(datetime(2026, 10, 1, 9)))
+    at = datetime(2026, 10, 1, 3, 55)
+    await b.ask("u", at=at)
+    await b.ask("s", at=at, sender="system")
+    assert seen == [(False, at), (True, at)]
+    assert turn_context.message_time() is None and not turn_context.is_system_turn()
+
+
+async def test_replay_skips_archive_and_prefixes(store):
+    log = []
+    b = Brain(store, factory(log), now=Clock(datetime(2026, 10, 1, 9)))
+    reply = await b.ask("log my lunch", at=datetime(2026, 10, 1, 8, 59), replay=True)
+    asked = [e[2] for e in log if e[0] == "ask"][0]
+    assert asked.startswith("[2026-10-01 08:59] [This message was interrupted by a restart before you replied.")
+    assert asked.endswith("log my lunch")
+    assert [h["sender"] for h in store.search_messages("lunch")] == ["argus"]
+    assert reply.endswith("log my lunch")
+
+
+@pytest.mark.parametrize("empty", ["", "   \n"])
+async def test_empty_reply_is_session_error(store, empty):
+    class Blank(FakeSession):
+        async def ask(self, text): return empty
+    async def f(resume): return Blank(resume, [])
+    b = Brain(store, f, now=Clock(datetime(2026, 10, 1, 9)))
+    with pytest.raises(SessionError, match="空回复"):
+        await b.ask("hello there")
+    assert [h["sender"] for h in store.search_messages("hello there")] == ["user"]

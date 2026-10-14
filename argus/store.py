@@ -234,6 +234,10 @@ class Store:
         self._lock = threading.Lock()
         self._conn = sqlite3.connect(db_path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
+        # WAL lets readers (query_data, backups) run alongside writes; busy_timeout makes a write
+        # that meets another connection's lock wait instead of failing with "database is locked".
+        self._conn.execute("PRAGMA busy_timeout=5000")
+        self._conn.execute("PRAGMA journal_mode=WAL")
         with self._lock, self._conn:
             self._conn.executescript(_SCHEMA)
         self._migrate_messages()
@@ -280,6 +284,14 @@ class Store:
             (_ts(ts), sender, content, session_id),
         )
         return cur.lastrowid
+
+    def has_message(self, sender: str, content: str, ts: datetime) -> bool:
+        """True if a message with exactly this sender, content and timestamp is archived."""
+        rows = self._read(
+            "SELECT 1 FROM messages WHERE sender = ? AND ts = ? AND content = ? LIMIT 1",
+            (sender, _ts(ts), content),
+        )
+        return bool(rows)
 
     def search_messages(
         self,

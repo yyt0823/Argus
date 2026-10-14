@@ -149,3 +149,32 @@ def test_query_data_describes_job_tables(env):
     _, _, t = env
     d = t["query_data"].description
     assert "job_postings(" in d and "job_runs(" in d
+
+
+# --- write tools refuse during system turns (H6) ---
+from argus import turn_context
+
+
+async def test_memory_writes_refused_in_system_turn(env):
+    _, mem, t = env
+    await t["memory_write"].handler({"name": "keep", "content": "c", "summary": "s"})
+    with turn_context.turn(system=True, at=datetime(2026, 10, 1, 9)):
+        w = await t["memory_write"].handler({"name": "evil", "content": "c", "summary": "s"})
+        d = await t["memory_delete"].handler({"name": "keep"})
+        # reads still work
+        assert not (await t["memory_read"].handler({"name": "keep"})).get("is_error")
+    for r in (w, d):
+        assert r["is_error"] is True and "direct request from the user" in text(r)
+    assert "evil" not in mem.index() and "keep" in mem.index()
+
+
+async def test_memory_writes_allowed_in_user_turn(env):
+    _, mem, t = env
+    with turn_context.turn(system=False, at=datetime(2026, 10, 1, 9)):
+        r = await t["memory_write"].handler({"name": "ok", "content": "c", "summary": "s"})
+    assert not r.get("is_error") and "ok" in mem.index()
+
+
+def test_query_data_describes_system_sender(env):
+    d = env[2]["query_data"].description
+    assert "'system'" in d and "scheduled" in d

@@ -35,6 +35,12 @@ INTERRUPT_TIMEOUT = 5  # seconds; the SDK's own control-request timeout is 60s
 _ABORTED = ("aborted_streaming", "aborted_tools")
 
 
+_DAY_BOUNDARY_NOTE = (
+    "Argus's day boundary is 04:00: between 00:00 and 04:00, 'today' for logs still means the "
+    "previous calendar date — call it 'today' / '今天' in replies, don't confuse the user with the date."
+)
+
+
 def build_system_prompt(persona: str, memory_index: str, now: datetime) -> str:
     """Persona, then the long-term memory index, then the current local time."""
     return (
@@ -43,7 +49,8 @@ def build_system_prompt(persona: str, memory_index: str, now: datetime) -> str:
         + (memory_index.strip() or "(empty)")
         + "\n\n# Now\n"
         + now.strftime("%Y-%m-%d %A %H:%M")
-        + " (local time)"
+        + " (local time)\n"
+        + _DAY_BOUNDARY_NOTE
     )
 
 

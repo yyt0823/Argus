@@ -477,3 +477,60 @@ def test_job_runs(store):
     assert row["cost_usd"] == 0.42 and row["finished_at"] == "2026-10-14T07:45:00"
     with pytest.raises(ValueError):
         store.add_job_run("other", datetime(2026, 10, 14))
+
+
+# --- WAL + busy timeout (M3) ---
+import threading as _threading
+
+
+def test_wal_and_busy_timeout(tmp_path):
+    s = Store(tmp_path / "w.db")
+    try:
+        assert s._conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+        assert s._conn.execute("PRAGMA busy_timeout").fetchone()[0] == 5000
+    finally:
+        s.close()
+    # reopen keeps WAL and data
+    s = Store(tmp_path / "w.db")
+    try:
+        s.set_state("k", "v")
+        assert s._conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+    finally:
+        s.close()
+    s = Store(tmp_path / "w.db")
+    try:
+        assert s.get_state("k") == "v"
+    finally:
+        s.close()
+
+
+def test_read_during_open_write_transaction(tmp_path):
+    from argus.tools.data import query_readonly
+    path = tmp_path / "w.db"
+    s = Store(path)
+    try:
+        s.set_state("a", "1")
+        writer = sqlite3.connect(path)
+        writer.execute("BEGIN IMMEDIATE")
+        writer.execute("INSERT INTO state (key, value) VALUES ('b', '2')")
+        # a separate read-only reader and the Store both read while the write is uncommitted
+        result = query_readonly(path, "SELECT key FROM state ORDER BY key")
+        assert [r[0] for r in result["rows"]] == ["a"]
+        assert s.get_state("b") is None
+        done = []
+        t = _threading.Thread(target=lambda: (s.set_state("c", "3"), done.append(1)))
+        t.start()
+        writer.commit(); writer.close()  # the Store's write waits (busy_timeout), then succeeds
+        t.join(5)
+        assert done == [1] and s.get_state("b") == "2" and s.get_state("c") == "3"
+    finally:
+        s.close()
+
+
+def test_has_message(store):
+    at = datetime(2026, 10, 1, 9, 30)
+    store.add_message("user", "hello", at)
+    assert store.has_message("user", "hello", at)
+    assert not store.has_message("user", "hello", datetime(2026, 10, 1, 9, 31))
+    assert not store.has_message("argus", "hello", at)
+    assert not store.has_message("user", "hell", at)

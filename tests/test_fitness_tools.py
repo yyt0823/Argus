@@ -275,3 +275,43 @@ async def test_handlers_never_raise(env):
             continue
         r = await h({**BREAKFAST, "id": 1, "weight_kg": 70, "kind": "A"})
         assert r["is_error"], name
+
+
+# --- system turns and send-time day (H6, M7) ---
+from argus import turn_context
+
+
+@pytest.mark.parametrize("name,args", [
+    ("food_log_add", BREAKFAST),
+    ("food_log_update", {"id": 1, "kcal": 1}),
+    ("food_log_delete", {"id": 1}),
+    ("weight_log_add", {"weight_kg": 80}),
+    ("workout_log_add", {"kind": "A"}),
+])
+async def test_write_tools_refused_in_system_turn(env, name, args):
+    _, store, _, tools = env
+    await tools["food_log_add"](BREAKFAST)
+    with turn_context.turn(system=True, at=NOW):
+        r = await tools[name](args)
+        assert not (await tools["nutrition_status"]({})).get("is_error")
+    assert r["is_error"] is True and "direct request from the user" in text(r)
+    assert len(store.foods_for_day(date(2026, 10, 14))) == 1
+    assert store.foods_for_day(date(2026, 10, 14))[0]["kcal"] == 520
+    assert store.weights_between(date(2026, 10, 1), date(2026, 10, 15)) == []
+    assert store.workouts_between(date(2026, 10, 1), date(2026, 10, 15)) == []
+
+
+async def test_default_day_uses_message_send_time(env):
+    _, store, clock, tools = env
+    clock.at = datetime(2026, 10, 15, 4, 5)  # handled after rollover...
+    with turn_context.turn(system=False, at=datetime(2026, 10, 15, 3, 55)):  # ...but sent before it
+        r = await tools["food_log_add"](BREAKFAST)
+        await tools["weight_log_add"]({"weight_kg": 80})
+        await tools["workout_log_add"]({"kind": "A"})
+    assert not r.get("is_error")
+    assert len(store.foods_for_day(date(2026, 10, 14))) == 1
+    assert [w["day"] for w in store.weights_between(date(2026, 10, 14), date(2026, 10, 15))] == ["2026-10-14"]
+    assert [w["day"] for w in store.workouts_between(date(2026, 10, 14), date(2026, 10, 15))] == ["2026-10-14"]
+    # outside a turn: now
+    await tools["food_log_add"](BREAKFAST)
+    assert len(store.foods_for_day(date(2026, 10, 15))) == 1

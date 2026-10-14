@@ -19,15 +19,24 @@ class FakeChannel(Channel):
         self.sent.append(text)
 
 class FakeBrain:
-    def __init__(self): self.asked, self.ats, self.senders, self.gate, self.fail, self.interrupts = [], [], [], None, None, 0
-    async def ask(self, text, at=None, sender="user"):
-        self.asked.append(text); self.ats.append(at); self.senders.append(sender)
-        if self.fail: e, self.fail = self.fail, None; raise e
+    def __init__(self):
+        self.asked, self.ats, self.senders, self.replays = [], [], [], []
+        self.gate, self.fail, self.interrupts = None, None, 0
+    async def ask(self, text, at=None, sender="user", replay=False):
+        self.asked.append(text); self.ats.append(at); self.senders.append(sender); self.replays.append(replay)
+        if self.fail:
+            if isinstance(self.fail, list):
+                e = self.fail.pop(0)
+            else:
+                e, self.fail = self.fail, None
+            if e is not None: raise e
         if self.gate:
             self._stop = asyncio.Event()
             g = asyncio.ensure_future(self.gate.wait()); s = asyncio.ensure_future(self._stop.wait())
-            done, _ = await asyncio.wait({g, s}, return_when=asyncio.FIRST_COMPLETED)
-            g.cancel(); s.cancel()
+            try:
+                done, _ = await asyncio.wait({g, s}, return_when=asyncio.FIRST_COMPLETED)
+            finally:
+                g.cancel(); s.cancel()
             if s in done: raise Interrupted()
         return f"re:{text}"
     async def interrupt(self):
@@ -194,7 +203,7 @@ async def test_user_messages_still_ask_as_user(parts):
     ch.push("a"); await run_until_idle(app)
     assert br.senders == ["user"]
 
-@pytest.mark.parametrize("err", [SessionError("quota"), RuntimeError("bug")])
+@pytest.mark.parametrize("err", [[SessionError("quota"), SessionError("quota")], RuntimeError("bug")])
 async def test_internal_task_failure_sends_nothing(parts, err):
     app, ch, br, s = parts
     br.fail = err
@@ -207,10 +216,11 @@ async def test_internal_task_failure_sends_nothing(parts, err):
 async def test_internal_failure_keeps_user_failures(parts):
     app, ch, br, s = parts
     br.fail = SessionError("x"); ch.push("mine"); await run_until_idle(app)
-    br.fail = SessionError("x"); await app.submit_internal("alert"); await run_until_idle(app)
+    br.fail = [SessionError("x"), SessionError("x")]; await app.submit_internal("alert")
+    await run_until_idle(app)
     assert json.loads(s.get_state("last_failed")) == ["mine"]
 
-async def test_internal_tasks_interleave_fifo(parts):
+async def test_user_messages_run_before_queued_internal_tasks(parts):
     app, ch, br, _ = parts
     br.gate = asyncio.Event()
     task = asyncio.create_task(app.run())
@@ -218,8 +228,8 @@ async def test_internal_tasks_interleave_fifo(parts):
     await app.submit_internal("i"); ch.push("b"); await asyncio.sleep(0.03)
     br.gate.set(); await asyncio.wait_for(app.drain(), 2); task.cancel()
     with pytest.raises(asyncio.CancelledError): await task
-    assert br.asked == ["a", "i", "b"] and br.senders == ["user", "system", "user"]
-    assert [m for m in ch.sent if m != SLOW_NOTICE] == ["re:a", "re:i", "re:b"]
+    assert br.asked == ["a", "b", "i"] and br.senders == ["user", "user", "system"]
+    assert [m for m in ch.sent if m != SLOW_NOTICE] == ["re:a", "re:b", "re:i"]
 
 async def test_no_slow_notice_for_internal_task(parts):
     app, ch, br, _ = parts
@@ -239,3 +249,149 @@ async def test_stop_interrupts_internal_task(parts):
     await asyncio.wait_for(app.drain(), 2); task.cancel()
     with pytest.raises(asyncio.CancelledError): await task
     assert br.interrupts == 1 and ch.sent == [STOPPED_REPLY]
+
+
+# --- review fixes: delivery callback, retry, shutdown, replay ---
+
+async def test_on_result_true_after_send(parts):
+    app, ch, br, _ = parts
+    results = []
+    await app.submit_internal("brief", on_result=lambda ok: results.append((ok, list(ch.sent))))
+    await run_until_idle(app)
+    assert results == [(True, ["re:brief"])]
+
+
+async def test_internal_session_error_retried_once(parts):
+    app, ch, br, _ = parts
+    results = []
+    br.fail = [SessionError("flaky")]
+    await app.submit_internal("brief", on_result=results.append)
+    await run_until_idle(app)
+    assert br.asked == ["brief", "brief"] and ch.sent == ["re:brief"] and results == [True]
+
+
+async def test_internal_retry_runs_after_waiting_user_message(parts):
+    app, ch, br, _ = parts
+    release = asyncio.Event(); calls = []
+    orig = br.ask
+    async def ask(text, at=None, sender="user", replay=False):
+        calls.append(text)
+        if text == "brief" and calls.count("brief") == 1:
+            await release.wait(); raise SessionError("flaky")
+        return await orig(text, at, sender, replay)
+    br.ask = ask
+    task = asyncio.create_task(app.run())
+    await app.submit_internal("brief"); await asyncio.sleep(0.03)
+    ch.push("mine"); await asyncio.sleep(0.03)     # arrives while the first attempt runs
+    release.set()
+    await asyncio.wait_for(app.drain(), 2); task.cancel()
+    with pytest.raises(asyncio.CancelledError): await task
+    assert calls == ["brief", "mine", "brief"] and ch.sent == ["re:mine", "re:brief"]
+
+
+@pytest.mark.parametrize("fail", [[SessionError("a"), SessionError("b")], RuntimeError("bug")])
+async def test_on_result_false_on_failure(parts, fail):
+    app, ch, br, _ = parts
+    results = []
+    br.fail = fail
+    await app.submit_internal("brief", on_result=results.append)
+    await run_until_idle(app)
+    assert results == [False] and ch.sent == []
+
+
+async def test_on_result_false_on_send_failure(parts):
+    app, ch, br, _ = parts
+    results = []
+    ch.fail_sends = 1
+    await app.submit_internal("brief", on_result=results.append)
+    await run_until_idle(app)
+    assert results == [False]
+
+
+async def test_on_result_false_when_stopped(parts):
+    app, ch, br, _ = parts
+    results = []
+    br.gate = asyncio.Event()
+    task = asyncio.create_task(app.run())
+    await app.submit_internal("long", on_result=results.append); await asyncio.sleep(0.05)
+    ch.push("停"); await asyncio.sleep(0.05)
+    await asyncio.wait_for(app.drain(), 2); task.cancel()
+    with pytest.raises(asyncio.CancelledError): await task
+    assert results == [False] and ch.sent == [STOPPED_REPLY]
+
+
+async def test_on_result_errors_are_swallowed(parts):
+    app, ch, br, _ = parts
+    def boom(ok): raise RuntimeError("callback bug")
+    await app.submit_internal("a", on_result=boom); ch.push("b")
+    await run_until_idle(app)
+    assert set(ch.sent) == {"re:a", "re:b"}
+
+
+def _pending(s, *items):
+    msgs = [IncomingMessage(id=i, text=t, received_at=datetime(2026, 10, 1, 9, n)) for n, (i, t) in enumerate(items)]
+    s.accept_messages(msgs, "imessage_last_rowid", "9")
+    return msgs
+
+
+async def test_shutdown_finishes_in_flight_and_keeps_rest_pending(parts):
+    app, ch, br, s = parts
+    _pending(s, ("G1", "first"), ("G2", "second"))
+    br.gate = asyncio.Event()
+    task = asyncio.create_task(app.run()); await asyncio.sleep(0.05)
+    assert br.asked == ["first"]
+    task.cancel(); await asyncio.sleep(0.05)
+    assert not task.done()          # waiting for the in-flight reply
+    br.gate.set()
+    with pytest.raises(asyncio.CancelledError): await asyncio.wait_for(task, 2)
+    assert br.asked == ["first"] and "re:first" in ch.sent
+    assert [m.id for m in s.list_pending()] == ["G2"]
+
+
+async def test_shutdown_gives_up_after_grace(tmp_path):
+    s = Store(tmp_path / "a.db"); ch, br = FakeChannel(), FakeBrain()
+    app = App(ch, br, s, poll_interval=0.01, slow_notice_seconds=5, shutdown_grace=0.05)
+    try:
+        _pending(s, ("G1", "first"))
+        br.gate = asyncio.Event()   # never released
+        task = asyncio.create_task(app.run()); await asyncio.sleep(0.05)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError): await asyncio.wait_for(task, 2)
+        assert ch.sent == [] and [m.id for m in s.list_pending()] == ["G1"]
+    finally:
+        s.close()
+
+
+async def test_shutdown_reports_unstarted_internal_tasks(parts):
+    app, ch, br, s = parts
+    results = []
+    br.gate = asyncio.Event()
+    task = asyncio.create_task(app.run())
+    ch.push("long"); await asyncio.sleep(0.05)
+    await app.submit_internal("later", on_result=results.append)
+    task.cancel(); await asyncio.sleep(0.02); br.gate.set()
+    with pytest.raises(asyncio.CancelledError): await asyncio.wait_for(task, 2)
+    assert br.asked == ["long"] and results == [False]
+
+
+async def test_idle_shutdown_is_immediate(parts):
+    app, ch, br, s = parts
+    task = asyncio.create_task(app.run()); await asyncio.sleep(0.03)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError): await asyncio.wait_for(task, 0.5)
+
+
+async def test_replay_of_already_archived_pending_message(parts):
+    app, ch, br, s = parts
+    _pending(s, ("G1", "log lunch"), ("G2", "new one"))
+    s.add_message("user", "log lunch", datetime(2026, 10, 1, 9, 0))   # archived before the restart
+    await run_until_idle(app)
+    assert br.asked == ["log lunch", "new one"] and br.replays == [True, False]
+    assert ch.sent == ["re:log lunch", "re:new one"] and s.list_pending() == []
+
+
+async def test_live_messages_are_not_replays(parts):
+    app, ch, br, s = parts
+    s.add_message("user", "a", datetime(2026, 10, 1))
+    ch.push("a"); await run_until_idle(app)
+    assert br.replays == [False]

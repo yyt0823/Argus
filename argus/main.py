@@ -199,7 +199,9 @@ async def _serve(cfg: Config, app: App) -> int:
     try:
         await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
     finally:
-        # App.run() closes the brain from its worker when cancelled.
+        # Cancelling App.run() starts its graceful shutdown: the reply in progress may finish (up to
+        # app.SHUTDOWN_GRACE seconds; launchd's ExitTimeOut is 60) and unstarted messages stay
+        # pending; its worker then closes the brain. gather() waits for all of that.
         for t in tasks:
             t.cancel()
         results = await asyncio.gather(*tasks, return_exceptions=True)

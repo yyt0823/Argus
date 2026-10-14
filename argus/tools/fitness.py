@@ -17,7 +17,8 @@ from argus.config import Config
 from argus.fitness.nutrition import day_status, format_day_status, period_summary, weight_averages
 from argus.scheduler import day_key
 from argus.store import MEALS, SODIUM_LEVELS, WORKOUT_KINDS, Store
-from argus.tools.server import _ToolError, _date_arg, _ok, _safe
+from argus.tools.server import _require_user_turn, _ToolError, _date_arg, _ok, _safe
+from argus.turn_context import message_time
 
 _READ_ONLY = ToolAnnotations(readOnlyHint=True)
 
@@ -113,10 +114,14 @@ def build_fitness_tools(
     def today() -> date:
         return day_key(now(), cfg.rollover_hour)
 
+    def default_day() -> date:
+        # The day the message was SENT: a snack sent at 03:55 and handled at 04:05 is yesterday's.
+        return day_key(message_time() or now(), cfg.rollover_hour)
+
     def day_arg(args: dict[str, Any], key: str = "day") -> date:
         day = _date_arg(args, key)
         if day is None:
-            return today()
+            return default_day()
         if day > today():
             raise _ToolError(f"Error: '{key}' {day.isoformat()} is in the future (today is {today().isoformat()})")
         return day
@@ -168,6 +173,7 @@ def build_fitness_tools(
     )
     @_safe
     async def food_log_add(args: dict[str, Any]) -> dict[str, Any]:
+        _require_user_turn()
         description = _text(args, "description")
         if description is None:
             raise _ToolError("Error: 'description' is required (what was eaten, with amounts)")
@@ -208,6 +214,7 @@ def build_fitness_tools(
     )
     @_safe
     async def food_log_update(args: dict[str, Any]) -> dict[str, Any]:
+        _require_user_turn()
         fid = _id(args)
         fields: dict[str, Any] = {}
         for key in _NUMERIC:
@@ -242,6 +249,7 @@ def build_fitness_tools(
     )
     @_safe
     async def food_log_delete(args: dict[str, Any]) -> dict[str, Any]:
+        _require_user_turn()
         fid = _id(args)
         try:
             row = await asyncio.to_thread(store.delete_food, fid)
@@ -284,6 +292,7 @@ def build_fitness_tools(
     )
     @_safe
     async def weight_log_add(args: dict[str, Any]) -> dict[str, Any]:
+        _require_user_turn()
         weight = _num(args, "weight_kg")
         waist = _num(args, "waist_cm", required=False)
         day = day_arg(args)
@@ -322,6 +331,7 @@ def build_fitness_tools(
     )
     @_safe
     async def workout_log_add(args: dict[str, Any]) -> dict[str, Any]:
+        _require_user_turn()
         kind = args.get("kind")
         if kind not in WORKOUT_KINDS:
             raise _ToolError(f"Error: 'kind' must be one of {', '.join(WORKOUT_KINDS)}, got {kind!r}")

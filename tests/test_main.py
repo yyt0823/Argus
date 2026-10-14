@@ -459,3 +459,55 @@ async def test_serve_runs_and_cancels_job_scheduler(tmp_path, monkeypatch):
     os.kill(os.getpid(), signal.SIGTERM)
     assert await asyncio.wait_for(serve, 5) == 0
     assert sched.cancelled
+
+
+class _SlowStopApp:
+    """An app whose run() needs a moment after cancellation to finish its in-flight reply."""
+    def __init__(self):
+        self.mail_watcher = None
+        self.started = asyncio.Event()
+        self.finished = False
+
+    async def run(self):
+        self.started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            await asyncio.sleep(0.2)
+            self.finished = True
+
+
+async def test_serve_waits_for_graceful_app_shutdown(tmp_path, monkeypatch):
+    import os
+    import signal
+
+    async def idle_backup(cfg):
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(main_mod, "backup_loop", idle_backup)
+    cfg = Config(root=tmp_path, self_handles=("+15550000000",), chat_db=tmp_path / "chat.db")
+    app = _SlowStopApp()
+    serve = asyncio.create_task(main_mod._serve(cfg, app))
+    await asyncio.wait_for(app.started.wait(), 5)
+    os.kill(os.getpid(), signal.SIGTERM)
+    assert await asyncio.wait_for(serve, 5) == 0
+    assert app.finished
+
+
+def test_launchd_exit_timeout_covers_shutdown_grace(tmp_path):
+    import plistlib
+    import subprocess
+    from pathlib import Path
+    from argus.app import SHUTDOWN_GRACE
+
+    template = Path(__file__).resolve().parent.parent / "ops" / "com.argus.agent.plist.template"
+    rendered = tmp_path / "agent.plist"
+    rendered.write_text(
+        template.read_text(encoding="utf-8").replace("__ROOT__", "/tmp/argus").replace("__HOME__", "/tmp"),
+        encoding="utf-8",
+    )
+    import shutil
+    if shutil.which("plutil"):
+        subprocess.run(["plutil", "-lint", str(rendered)], check=True, capture_output=True)
+    data = plistlib.loads(rendered.read_bytes())
+    assert data["ExitTimeOut"] >= 60 and data["ExitTimeOut"] >= SHUTDOWN_GRACE + 10

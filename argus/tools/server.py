@@ -24,6 +24,7 @@ from claude_agent_sdk import (
 )
 
 from argus.store import Store
+from argus.turn_context import is_system_turn
 from argus.tools.data import QueryError, query_readonly
 from argus.tools.history import format_history
 from argus.tools.memory import MemoryStore
@@ -77,6 +78,18 @@ def _safe(handler: Handler) -> Handler:
             return _err(f"Error: {type(e).__name__}: {e}")
 
     return wrapper
+
+
+SYSTEM_TURN_REFUSAL = (
+    "This action needs a direct request from the user; not allowed while handling an automated "
+    "briefing/alert."
+)
+
+
+def _require_user_turn() -> None:
+    """Refuse a write while Argus handles an internal task: its prompt carries untrusted text."""
+    if is_system_turn():
+        raise _ToolError(SYSTEM_TURN_REFUSAL)
 
 
 def _str_arg(args: dict[str, Any], key: str) -> str:
@@ -183,6 +196,7 @@ def build_tools(
     )
     @_safe
     async def memory_write(args: dict[str, Any]) -> dict[str, Any]:
+        _require_user_turn()
         name = _str_arg(args, "name")
         content, summary = _str_arg(args, "content"), _str_arg(args, "summary")
         await asyncio.to_thread(_locked, memory.write, name, content, summary)
@@ -200,6 +214,7 @@ def build_tools(
     )
     @_safe
     async def memory_delete(args: dict[str, Any]) -> dict[str, Any]:
+        _require_user_turn()
         name = _str_arg(args, "name")
         await asyncio.to_thread(_locked, memory.delete, name)
         return _ok(f"deleted {name}")
@@ -209,7 +224,9 @@ def build_tools(
         "Run one read-only SQL (SQLite) SELECT over Argus's database and get JSON "
         '{"columns", "rows", "truncated"} (at most 200 rows). Tables: '
         "messages(id, ts, sender, content, session_id) — every chat message, ts is local "
-        "ISO-8601 text like '2026-10-01T09:30:00', sender is 'user' or 'argus'; "
+        "ISO-8601 text like '2026-10-01T09:30:00', sender is 'user', 'argus' or 'system' "
+        "('system' rows are Argus's own scheduled prompts for internal tasks such as briefings and "
+        "alerts, not the user's words); "
         "sessions(id, day, sdk_session_id, started_at, ended_at) — one per day (day rolls over "
         "at 04:00); "
         "mail_triage(mail_id, account, sender, subject, received_at, important, category, summary, "
