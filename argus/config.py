@@ -2,9 +2,32 @@
 
 from __future__ import annotations
 
+import re
 import tomllib
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import time
 from pathlib import Path
+
+
+@dataclass(frozen=True)
+class MailConfig:
+    """The optional ``[mail]`` table: mail triage, alerts, and the daily briefing."""
+
+    enabled: bool = True
+    briefing_time: time = time(8, 0)
+    quiet_start: time = time(23, 0)
+    quiet_end: time = time(8, 0)
+    check_interval_minutes: float = 5.0
+    triage_model: str = "haiku"
+
+    def in_quiet_hours(self, t: time) -> bool:
+        """True if ``t`` is in ``[quiet_start, quiet_end)``; the range may cross midnight.
+
+        Equal start and end mean no quiet hours.
+        """
+        if self.quiet_start <= self.quiet_end:
+            return self.quiet_start <= t < self.quiet_end
+        return t >= self.quiet_start or t < self.quiet_end
 
 
 @dataclass(frozen=True)
@@ -21,6 +44,7 @@ class Config:
     backup_keep: int = 30
     model: str | None = None
     mode: str = "self"
+    mail: MailConfig = field(default_factory=MailConfig)
 
     @property
     def data_dir(self) -> Path:
@@ -72,4 +96,43 @@ def load_config(root: Path) -> Config:
     kwargs["mode"] = mode
     if "chat_db" in raw:
         kwargs["chat_db"] = Path(raw["chat_db"]).expanduser()
+    kwargs["mail"] = _load_mail(raw.get("mail", {}), path)
     return Config(root=root, self_handles=tuple(h.strip() for h in handles), **kwargs)
+
+
+_HHMM = re.compile(r"([01]\d|2[0-3]):([0-5]\d)")
+_MAIL_TIME_KEYS = ("briefing_time", "quiet_start", "quiet_end")
+_MAIL_KEYS = ("enabled", "check_interval_minutes", "triage_model", *_MAIL_TIME_KEYS)
+
+
+def _load_mail(raw: object, path: Path) -> MailConfig:
+    """Validate the optional ``[mail]`` table; raise ``ValueError`` naming ``mail.<key>``."""
+    if not isinstance(raw, dict):
+        raise ValueError(f"{path}: mail must be a table ([mail])")
+    unknown = sorted(set(raw) - set(_MAIL_KEYS))
+    if unknown:
+        raise ValueError(f"{path}: unknown key(s) in [mail]: {', '.join(unknown)}")
+
+    kwargs: dict = {}
+    if "enabled" in raw:
+        if not isinstance(raw["enabled"], bool):
+            raise ValueError(f"{path}: mail.enabled must be true or false")
+        kwargs["enabled"] = raw["enabled"]
+    for key in _MAIL_TIME_KEYS:
+        if key in raw:
+            value = raw[key]
+            m = _HHMM.fullmatch(value) if isinstance(value, str) else None
+            if m is None:
+                raise ValueError(f'{path}: mail.{key} must be a "HH:MM" string, got {value!r}')
+            kwargs[key] = time(int(m[1]), int(m[2]))
+    if "check_interval_minutes" in raw:
+        value = raw["check_interval_minutes"]
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+            raise ValueError(f"{path}: mail.check_interval_minutes must be a positive number, got {value!r}")
+        kwargs["check_interval_minutes"] = float(value)
+    if "triage_model" in raw:
+        value = raw["triage_model"]
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"{path}: mail.triage_model must be a non-empty string, got {value!r}")
+        kwargs["triage_model"] = value.strip()
+    return MailConfig(**kwargs)

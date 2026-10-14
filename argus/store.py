@@ -1,4 +1,5 @@
-"""SQLite persistence for ``data/argus.db``: message archive, sessions, sent ids, and key/value state.
+"""SQLite persistence for ``data/argus.db``: message archive, sessions, sent ids, key/value state,
+and mail triage verdicts.
 
 This module is the only writer of the database.
 """
@@ -13,20 +14,27 @@ from typing import Literal
 
 from argus.channel.base import IncomingMessage
 
-_SCHEMA = """
-CREATE TABLE IF NOT EXISTS messages (
+# ``{name}`` is ``messages`` normally and ``messages_new`` while migrating an older schema.
+_MESSAGES_TABLE = """
+CREATE TABLE IF NOT EXISTS {name} (
     id INTEGER PRIMARY KEY,
     ts TEXT NOT NULL,
-    sender TEXT NOT NULL CHECK (sender IN ('user','argus')),
+    sender TEXT NOT NULL CHECK (sender IN ('user','argus','system')),
     content TEXT NOT NULL,
     session_id INTEGER
 );
-CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
-    content, content='messages', content_rowid='id', tokenize='trigram'
-);
+"""
+_MESSAGES_TRIGGER = """
 CREATE TRIGGER IF NOT EXISTS messages_ai AFTER INSERT ON messages BEGIN
     INSERT INTO messages_fts(rowid, content) VALUES (new.id, new.content);
 END;
+"""
+
+_SCHEMA = _MESSAGES_TABLE.format(name="messages") + """
+CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
+    content, content='messages', content_rowid='id', tokenize='trigram'
+);
+""" + _MESSAGES_TRIGGER + """
 CREATE TABLE IF NOT EXISTS sessions (
     id INTEGER PRIMARY KEY,
     day TEXT NOT NULL UNIQUE,
@@ -37,7 +45,45 @@ CREATE TABLE IF NOT EXISTS sessions (
 CREATE TABLE IF NOT EXISTS sent_ids (guid TEXT PRIMARY KEY, sent_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS state (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS pending (guid TEXT PRIMARY KEY, text TEXT NOT NULL, at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS mail_triage (
+    mail_id INTEGER PRIMARY KEY,
+    account TEXT,
+    sender TEXT,
+    subject TEXT,
+    received_at TEXT NOT NULL,
+    important INTEGER,
+    category TEXT,
+    summary TEXT,
+    action TEXT,
+    deadline TEXT,
+    status TEXT NOT NULL,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    alerted_at TEXT,
+    briefed_at TEXT,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS mail_triage_received ON mail_triage (received_at);
 """
+
+# Rebuilds ``messages`` (keeping ids) with the current sender CHECK; run inside one transaction.
+_MIGRATE_MESSAGES = (
+    _MESSAGES_TABLE.format(name="messages_new")
+    + """
+INSERT INTO messages_new (id, ts, sender, content, session_id)
+    SELECT id, ts, sender, content, session_id FROM messages;
+DROP TABLE messages;
+ALTER TABLE messages_new RENAME TO messages;
+"""
+    + _MESSAGES_TRIGGER
+    + """
+INSERT INTO messages_fts(messages_fts) VALUES ('rebuild');
+"""
+)
+
+_TRIAGE_FIELDS = (
+    "mail_id", "account", "sender", "subject", "received_at", "important", "category",
+    "summary", "action", "deadline", "status", "attempts",
+)
 
 # The trigram tokenizer cannot match terms shorter than 3 characters.
 _MIN_FTS_TERM = 3
@@ -59,6 +105,23 @@ class Store:
         self._conn.row_factory = sqlite3.Row
         with self._lock, self._conn:
             self._conn.executescript(_SCHEMA)
+        self._migrate_messages()
+
+    def _migrate_messages(self) -> None:
+        """Allow sender 'system' in a database created before it existed."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'messages'"
+            ).fetchone()
+            if "'system'" in row["sql"]:
+                return
+            # executescript() does not manage transactions, so wrap the rebuild explicitly.
+            try:
+                self._conn.executescript("BEGIN IMMEDIATE;\n" + _MIGRATE_MESSAGES + "\nCOMMIT;")
+            except BaseException:
+                if self._conn.in_transaction:
+                    self._conn.rollback()
+                raise
 
     def close(self) -> None:
         with self._lock:
@@ -76,7 +139,7 @@ class Store:
 
     def add_message(
         self,
-        sender: Literal["user", "argus"],
+        sender: Literal["user", "argus", "system"],
         content: str,
         ts: datetime,
         session_id: int | None = None,
@@ -196,3 +259,64 @@ class Store:
 
     def delete_pending(self, guid: str) -> None:
         self._write("DELETE FROM pending WHERE guid = ?", (guid,))
+
+    # --- mail triage (one row per Mail message id) ---
+
+    def upsert_triage(self, row: dict) -> None:
+        """Insert or replace the verdict for ``row["mail_id"]``.
+
+        ``alerted_at``, ``briefed_at`` and ``created_at`` of an existing row are kept.
+        """
+        values = {k: row[k] for k in _TRIAGE_FIELDS}
+        values["received_at"] = _ts(values["received_at"])
+        if values["important"] is not None:
+            values["important"] = int(bool(values["important"]))
+        values["created_at"] = _ts(datetime.now())
+        cols = ", ".join(values)
+        updates = ", ".join(f"{k} = excluded.{k}" for k in _TRIAGE_FIELDS if k != "mail_id")
+        self._write(
+            f"INSERT INTO mail_triage ({cols}) VALUES ({', '.join('?' * len(values))}) "
+            f"ON CONFLICT(mail_id) DO UPDATE SET {updates}",
+            tuple(values.values()),
+        )
+
+    def get_triage(self, mail_id: int) -> dict | None:
+        rows = self._read("SELECT * FROM mail_triage WHERE mail_id = ?", (mail_id,))
+        return _triage_dict(rows[0]) if rows else None
+
+    def triage_between(self, start: datetime, end: datetime, important_only: bool = False) -> list[dict]:
+        """Rows with ``start <= received_at < end``, oldest first."""
+        sql = "SELECT * FROM mail_triage WHERE received_at >= ? AND received_at < ?"
+        if important_only:
+            sql += " AND important = 1"
+        rows = self._read(sql + " ORDER BY received_at, mail_id", (_ts(start), _ts(end)))
+        return [_triage_dict(r) for r in rows]
+
+    def failed_triage(self, max_attempts: int = 3) -> list[dict]:
+        """Failed rows that may be retried, oldest first."""
+        rows = self._read(
+            "SELECT * FROM mail_triage WHERE status = 'failed' AND attempts < ? "
+            "ORDER BY received_at, mail_id",
+            (max_attempts,),
+        )
+        return [_triage_dict(r) for r in rows]
+
+    def mark_alerted(self, mail_ids: list[int], at: datetime) -> None:
+        self._mark("alerted_at", mail_ids, at)
+
+    def mark_briefed(self, mail_ids: list[int], at: datetime) -> None:
+        self._mark("briefed_at", mail_ids, at)
+
+    def _mark(self, column: str, mail_ids: list[int], at: datetime) -> None:
+        with self._lock, self._conn:
+            self._conn.executemany(
+                f"UPDATE mail_triage SET {column} = ? WHERE mail_id = ?",
+                [(_ts(at), i) for i in mail_ids],
+            )
+
+
+def _triage_dict(row: sqlite3.Row) -> dict:
+    d = dict(row)
+    if d["important"] is not None:
+        d["important"] = bool(d["important"])
+    return d
