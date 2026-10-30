@@ -164,6 +164,7 @@ _FOOD_COLUMNS = (
 
 JOB_STATUSES = (
     "new", "reported", "queued", "applying", "submitted", "needs_login", "needs_attestation", "needs_user", "skipped", "error",
+    "notify_only",
 )
 JOB_RUN_KINDS = ("scout", "apply")
 _POSTING_FIELDS = ("company", "role", "city", "term", "deadline", "fit", "notes", "verified", "ats")

@@ -76,6 +76,9 @@ class ApplyResult:
     guessed_answers: list[str] = field(default_factory=list)
     cost_usd: float | None = None
     raw: str = ""
+    accounts_created: tuple[str, ...] = ()  # sites jobagent registered an account on
+    company: str | None = None
+    role: str | None = None
 
 
 def transcript_paths(cfg: Config) -> list[Path]:

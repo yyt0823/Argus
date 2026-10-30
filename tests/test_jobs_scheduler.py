@@ -390,7 +390,7 @@ async def test_apply_fn_exception_counts_as_error(env):
 
 async def test_apply_timeout_is_error_not_retried(env, monkeypatch):
     import argus.jobs.scheduler as mod
-    monkeypatch.setattr(mod, "APPLY_TIMEOUT", 0.01)
+    monkeypatch.setattr(mod, "apply_timeout", lambda cfg: 0.01)
     _scouted(env)
     pid = env.add(U("x"), fit=5)
     env.apply.gate = asyncio.Event()  # never set: the run hangs
@@ -726,3 +726,12 @@ async def test_daily_scout_finishing_after_briefing_reports_itself(tmp_path):
     await s._scout()
     assert len(sent) == 1 and "X" in sent[0]
     store.close()
+
+
+def test_apply_timeout_covers_jobagent_and_human_wait(tmp_path):
+    from dataclasses import replace
+    from argus.config import Config, JobsConfig
+    from argus.jobs.scheduler import apply_timeout
+    cfg = Config(root=tmp_path, self_handles=("+15555550100",))
+    assert apply_timeout(cfg) == (30 + 30 + 15) * 60
+    assert apply_timeout(replace(cfg, jobs=JobsConfig(human_timeout_minutes=5))) == 50 * 60

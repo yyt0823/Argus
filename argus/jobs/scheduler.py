@@ -63,8 +63,12 @@ QUEUE_MAX_AGE = timedelta(days=7)
 CHROME_PAUSE = timedelta(minutes=30)  # wait before retrying after "chrome_not_connected"
 CHROME_RETRIES_PER_DAY = 3  # then wait until the next day
 SCOUT_TIMEOUT = 45 * 60.0  # seconds
-APPLY_TIMEOUT = 30 * 60.0
 QUEUE_SCAN_LIMIT = 1000
+
+
+def apply_timeout(cfg: Config) -> float:
+    """Seconds one application may take: jobagent's own work, a wait for the user's answer, and slack."""
+    return (30 + cfg.jobs.human_timeout_minutes + 15) * 60.0
 
 KEY_LAST_SCOUT = "jobs_last_scout"
 KEY_CHROME_NOTIFIED = "jobs_chrome_notified"
@@ -401,7 +405,7 @@ class JobScheduler:
             self._bump(started.date(), "runs", *(() if _is_requested(posting) else ("auto_runs",)))
             run_id = self._store.add_job_run("apply", started)
             try:
-                result = await asyncio.wait_for(self._apply_fn(self._cfg, posting), APPLY_TIMEOUT)
+                result = await asyncio.wait_for(self._apply_fn(self._cfg, posting), apply_timeout(self._cfg))
             except asyncio.TimeoutError:
                 log.warning("application #%s timed out", pid)
                 result = ApplyResult(result="error", detail=TIMED_OUT_DETAIL)

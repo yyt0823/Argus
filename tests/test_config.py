@@ -217,3 +217,56 @@ def test_jobs_invalid(tmp_path: Path, extra):
     _write(tmp_path, extra)
     with pytest.raises(ValueError, match="jobs"):
         load_config(tmp_path)
+
+# --- [jobs] jobagent keys ---
+
+def test_jobs_jobagent_defaults(tmp_path: Path):
+    _write(tmp_path)
+    cfg = load_config(tmp_path)
+    j = cfg.jobs
+    assert j.jobagent_dir == "~/Desktop/side_project/job_finding_agent"
+    assert j.jobagent_profile == "config/profile.yaml"
+    assert j.jobagent_model is None
+    assert j.notify_only_companies == ("Google", "Amazon", "Meta", "Apple", "Microsoft", "Nvidia", "OpenAI")
+    assert j.human_timeout_minutes == 30 and j.summary_mail_wait_minutes == 20
+    assert cfg.jobagent_dir == Path.home() / "Desktop/side_project/job_finding_agent"
+    assert cfg.jobagent_live_dir == cfg.jobagent_dir / "data" / "live"
+
+def test_jobs_jobagent_keys_parsed(tmp_path: Path):
+    _write(tmp_path, '[jobs]\njobagent_dir = "/abs/ja"\njobagent_profile = "cfg/p.yaml"\n'
+                     'jobagent_model = "claude-x"\nnotify_only_companies = ["Acme", " Initech "]\n'
+                     'human_timeout_minutes = 45\nsummary_mail_wait_minutes = 5\n')
+    cfg = load_config(tmp_path)
+    j = cfg.jobs
+    assert j.jobagent_dir == "/abs/ja" and j.jobagent_profile == "cfg/p.yaml" and j.jobagent_model == "claude-x"
+    assert j.notify_only_companies == ("Acme", "Initech")
+    assert j.human_timeout_minutes == 45 and j.summary_mail_wait_minutes == 5
+    assert cfg.jobagent_dir == Path("/abs/ja")
+    assert cfg.jobagent_live_dir == Path("/abs/ja/data/live")
+
+def test_jobs_jobagent_dir_relative_to_root(tmp_path: Path):
+    _write(tmp_path, '[jobs]\njobagent_dir = "ja"\n')
+    assert load_config(tmp_path).jobagent_dir == tmp_path / "ja"
+
+def test_jobs_notify_only_empty_list_allowed(tmp_path: Path):
+    _write(tmp_path, '[jobs]\nnotify_only_companies = []\n')
+    assert load_config(tmp_path).jobs.notify_only_companies == ()
+
+@pytest.mark.parametrize("extra, key", [
+    ('jobagent_dir = ""', "jobagent_dir"),
+    ('jobagent_profile = 3', "jobagent_profile"),
+    ('jobagent_model = ""', "jobagent_model"),
+    ('jobagent_model = 1', "jobagent_model"),
+    ('notify_only_companies = "Google"', "notify_only_companies"),
+    ('notify_only_companies = ["Google", ""]', "notify_only_companies"),
+    ('notify_only_companies = ["Google", 3]', "notify_only_companies"),
+    ('human_timeout_minutes = 0', "human_timeout_minutes"),
+    ('human_timeout_minutes = 1.5', "human_timeout_minutes"),
+    ('human_timeout_minutes = true', "human_timeout_minutes"),
+    ('summary_mail_wait_minutes = -1', "summary_mail_wait_minutes"),
+    ('summary_mail_wait_minutes = "20"', "summary_mail_wait_minutes"),
+])
+def test_jobs_jobagent_invalid(tmp_path: Path, extra, key):
+    _write(tmp_path, f'[jobs]\n{extra}\n')
+    with pytest.raises(ValueError, match=f"jobs\\.{key}"):
+        load_config(tmp_path)

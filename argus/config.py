@@ -69,6 +69,12 @@ class JobsConfig:
     internships_dir: str = "data/about_me/internships"
     resume_path: str = "data/about_me/yantian_yin_cv.pdf"
     cli_path: str = "/opt/homebrew/bin/claude"
+    jobagent_dir: str = "~/Desktop/side_project/job_finding_agent"
+    jobagent_profile: str = "config/profile.yaml"  # relative to jobagent_dir (absolute paths are kept)
+    jobagent_model: str | None = None  # None: jobagent's default model
+    notify_only_companies: tuple[str, ...] = ("Google", "Amazon", "Meta", "Apple", "Microsoft", "Nvidia", "OpenAI")
+    human_timeout_minutes: int = 30  # how long jobagent waits for an answer from the user
+    summary_mail_wait_minutes: int = 20
 
     def in_apply_window(self, t: time) -> bool:
         """True if ``t`` is in ``[apply_window[0], apply_window[1])``."""
@@ -132,6 +138,16 @@ class Config:
     def jobs_resume_path(self) -> Path:
         """``jobs.resume_path`` resolved against ``root`` (absolute paths are kept)."""
         return self.root / Path(self.jobs.resume_path).expanduser()
+
+    @property
+    def jobagent_dir(self) -> Path:
+        """``jobs.jobagent_dir`` resolved against ``root`` (absolute and ``~`` paths are kept)."""
+        return self.root / Path(self.jobs.jobagent_dir).expanduser()
+
+    @property
+    def jobagent_live_dir(self) -> Path:
+        """jobagent's data directory for real runs (``JOBAGENT_DATA_DIR``)."""
+        return self.jobagent_dir / "data" / "live"
 
 
 MODES = ("self", "contact")
@@ -270,11 +286,12 @@ def _load_fitness(raw: object, path: Path) -> FitnessConfig:
 
 
 _JOBS_BOOL_KEYS = ("enabled", "auto_apply")
-_JOBS_PATH_KEYS = ("internships_dir", "resume_path", "cli_path")
+_JOBS_PATH_KEYS = ("internships_dir", "resume_path", "cli_path", "jobagent_dir", "jobagent_profile")
 _JOBS_BUDGET_KEYS = ("scout_budget_usd", "apply_budget_usd")
+_JOBS_MINUTES_KEYS = ("human_timeout_minutes", "summary_mail_wait_minutes")
 _JOBS_KEYS = (
-    *_JOBS_BOOL_KEYS, *_JOBS_PATH_KEYS, *_JOBS_BUDGET_KEYS, "scout_time", "min_fit_apply", "daily_apply_limit",
-    "apply_window",
+    *_JOBS_BOOL_KEYS, *_JOBS_PATH_KEYS, *_JOBS_BUDGET_KEYS, *_JOBS_MINUTES_KEYS, "scout_time", "min_fit_apply",
+    "daily_apply_limit", "apply_window", "jobagent_model", "notify_only_companies",
 )
 
 
@@ -332,4 +349,20 @@ def _load_jobs(raw: object, path: Path) -> JobsConfig:
                 f'{path}: jobs.apply_window must be ["HH:MM", "HH:MM"] with start < end, got {value!r}'
             )
         kwargs["apply_window"] = (times[0], times[1])
+    for key in _JOBS_MINUTES_KEYS:
+        if key in raw:
+            value = raw[key]
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValueError(f"{path}: jobs.{key} must be a positive integer (minutes), got {value!r}")
+            kwargs[key] = value
+    if "jobagent_model" in raw:
+        value = raw["jobagent_model"]
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"{path}: jobs.jobagent_model must be a non-empty string, got {value!r}")
+        kwargs["jobagent_model"] = value.strip()
+    if "notify_only_companies" in raw:
+        value = raw["notify_only_companies"]
+        if not isinstance(value, list) or not all(isinstance(v, str) and v.strip() for v in value):
+            raise ValueError(f"{path}: jobs.notify_only_companies must be a list of non-empty strings, got {value!r}")
+        kwargs["notify_only_companies"] = tuple(v.strip() for v in value)
     return JobsConfig(**kwargs)
