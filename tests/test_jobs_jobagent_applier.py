@@ -298,3 +298,48 @@ def test_preflight_missing_bin_and_profile(env, tmp_path):
     assert "profile" in preflight(env.cfg)
     (tmp_path / "ja" / "bin" / "jobagent").unlink()
     assert "bin/jobagent" in preflight(env.cfg)
+
+
+def test_preflight_falls_back_to_personal_email(env, tmp_path):
+    profile = tmp_path / "ja" / "config" / "profile.yaml"
+    profile.write_text("personal:\n  first_name: A\n  email: me@yyt.email\naccount:\n  password: ''\n")
+    assert "me@yyt.email" in preflight(env.cfg)
+    profile.write_text("personal:\n  email: me@yyt.email\n")
+    assert "me@yyt.email" in preflight(env.cfg)
+    profile.write_text('personal:\n  email: me@yyt.email\naccount:\n  email: ""\n')
+    assert "me@yyt.email" in preflight(env.cfg)
+
+
+def test_preflight_test_email_is_case_insensitive(env, tmp_path):
+    (tmp_path / "ja" / "config" / "profile.yaml").write_text("account:\n  email: Me@YYT.Email\n")
+    assert preflight(env.cfg) is not None
+
+
+async def test_apply_refuses_when_preflight_fails(env, tmp_path):
+    (tmp_path / "ja" / "config" / "profile.yaml").write_text("account:\n  email: me@yyt.email\n")
+    r = await apply_with_jobagent(env.cfg, POSTING, reader=None, relay=None, run_dir=env.run_dir,
+                                  spawn=env.make_spawn(result={"status": "submitted"}))
+    assert r.result == "error" and "me@yyt.email" in r.detail
+    assert env.calls == [] and not env.run_dir.exists()
+
+
+async def test_normal_exit_sweeps_leftover_children(env):
+    r = await apply_with_jobagent(env.cfg, POSTING, reader=None, relay=None, run_dir=env.run_dir,
+                                  spawn=env.make_spawn(result={"status": "submitted"}, grandchild=True))
+    assert r.result == "submitted"
+    assert await _wait_gone(env.read_probe()["grandchild"], 2)
+
+
+async def test_second_cancel_during_grace_still_sigkills(env):
+    task = asyncio.create_task(apply_with_jobagent(
+        env.cfg, POSTING, reader=None, relay=None, run_dir=env.run_dir,
+        spawn=env.make_spawn(sleep=60, ignore_term=True)))
+    while not env.probe.exists():
+        await asyncio.sleep(0.05)
+    await asyncio.sleep(0.2)
+    task.cancel()
+    await asyncio.sleep(0.3)  # now in the SIGTERM grace wait (10 s)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert await _wait_gone(env.read_probe()["pid"], 2)

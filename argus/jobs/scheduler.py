@@ -70,6 +70,7 @@ def apply_timeout(cfg: Config) -> float:
     """Seconds one application may take: jobagent's own work, a wait for the user's answer, and slack."""
     return (30 + cfg.jobs.human_timeout_minutes + 15) * 60.0
 
+
 KEY_LAST_SCOUT = "jobs_last_scout"
 KEY_CHROME_NOTIFIED = "jobs_chrome_notified"
 KEY_DAY_COUNTS = "jobs_day_counts"

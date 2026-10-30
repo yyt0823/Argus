@@ -43,8 +43,8 @@ KILL_GRACE_S = 10.0  # after SIGTERM, before SIGKILL
 DETAIL_MAX = 500
 LOG_TAIL = 300
 
-# The indented lines after a top-level ``account:`` key, and the ``email:`` value among them.
-_ACCOUNT_BLOCK = re.compile(r"^account:[ \t]*(?:#.*)?\n((?:(?:[ \t]+.*|[ \t]*)(?:\n|$))*)", re.MULTILINE)
+# The indented lines after a top-level ``<name>:`` key, and the ``email:`` value among them.
+_BLOCK = r"^{name}:[ \t]*(?:#.*)?\n((?:(?:[ \t]+.*|[ \t]*)(?:\n|$))*)"
 _EMAIL_LINE = re.compile(r"""^[ \t]+email:[ \t]*["']?([^"'\s#]*)""", re.MULTILINE)
 
 
@@ -61,10 +61,15 @@ def jobagent_profile(cfg: Config) -> Path:
     return cfg.jobagent_dir / Path(cfg.jobs.jobagent_profile).expanduser()
 
 
-def _account_email(profile_text: str) -> str | None:
-    block = _ACCOUNT_BLOCK.search(profile_text)
+def _block_email(profile_text: str, name: str) -> str | None:
+    block = re.search(_BLOCK.format(name=name), profile_text, re.MULTILINE)
     m = _EMAIL_LINE.search(block[1]) if block else None
-    return m[1] if m else None
+    return m[1] if m and m[1] else None
+
+
+def _login_email(profile_text: str) -> str | None:
+    """The email jobagent logs in with: ``account.email``, else ``personal.email``."""
+    return _block_email(profile_text, "account") or _block_email(profile_text, "personal")
 
 
 def preflight(cfg: Config) -> str | None:
@@ -78,7 +83,8 @@ def preflight(cfg: Config) -> str | None:
         text = profile.read_text(encoding="utf-8")
     except OSError:
         return f"jobagent profile not found: {profile}"
-    if _account_email(text) == TEST_EMAIL:
+    email = _login_email(text)
+    if email is not None and email.casefold() == TEST_EMAIL.casefold():
         return f"jobagent profile {profile} uses the test account {TEST_EMAIL}"
     return None
 
@@ -145,11 +151,17 @@ async def _stop(proc: asyncio.subprocess.Process) -> None:
         await asyncio.wait_for(proc.wait(), KILL_GRACE_S)
     except TimeoutError:
         pass
-    try:  # also takes down children that outlived the leader
-        os.killpg(proc.pid, signal.SIGKILL)
+    finally:  # even if cancelled again during the grace wait
+        _kill_group(proc.pid)
+    await proc.wait()
+
+
+def _kill_group(pgid: int) -> None:
+    """SIGKILL what is left of jobagent's process group (e.g. a browser that outlived it)."""
+    try:
+        os.killpg(pgid, signal.SIGKILL)
     except ProcessLookupError:
         pass
-    await proc.wait()
 
 
 async def _cancel_all(tasks: list[asyncio.Task]) -> None:
@@ -171,8 +183,12 @@ async def apply_with_jobagent(
 ) -> ApplyResult:
     """Run one jobagent application for ``posting`` and map its result.
 
-    Cancellation stops jobagent's whole process group and re-raises.
+    Cancellation stops jobagent's whole process group and re-raises. If ``preflight`` fails,
+    jobagent is not started and the result is ``error`` with the reason.
     """
+    refused = preflight(cfg)
+    if refused is not None:
+        return ApplyResult(result="error", detail=refused)
     if run_dir is None:
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         run_dir = cfg.jobagent_live_dir / "argus" / f"{posting['id']}-{stamp}"
@@ -208,6 +224,7 @@ async def apply_with_jobagent(
         except asyncio.CancelledError:
             await _stop(proc)
             raise
+        _kill_group(proc.pid)
     finally:
         await _cancel_all(tasks)
     return read_result(result_file, log_path)
