@@ -14,7 +14,8 @@
    (explicitly requested ones first, then oldest) and applies to it in the background with
    jobagent (``jobagent_applier.apply_with_jobagent``).
 
-Notify-only companies (``jobs.notify_only_companies``, compared with ``dedup.norm_company``): a
+Notify-only companies (``jobs.notify_only_companies``, matched by ``is_notify_only_company``:
+whole words of the normalized company name, or the posting URL's host label / ATS board name): a
 scouted ``new`` posting of such a company becomes ``notify_only`` and the user gets one alert
 right away. It is never queued automatically (upsert keeps the status, so the alert is sent once).
 Older rows are covered too: ``_queue_auto`` turns a ``new`` notify-only posting into
@@ -86,6 +87,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import replace
 from datetime import date, datetime, timedelta
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from argus.config import Config
 from argus.jobs.agent import untrusted_block
@@ -109,6 +111,36 @@ QUEUE_MAX_AGE = timedelta(days=7)
 SCOUT_TIMEOUT = 45 * 60.0  # seconds
 QUEUE_SCAN_LIMIT = 1000
 SUMMARY_MAIL_LIMIT = 500  # inbox messages read for one run summary
+
+
+# ATS hosts whose first path segment is the company's board name (jobs.ashbyhq.com/openai).
+_BOARD_HOSTS = ("jobs.ashbyhq.com", "boards.greenhouse.io", "jobs.lever.co")
+
+
+def is_notify_only_company(company: str | None, url: str | None, entries) -> bool:
+    """True when a posting belongs to a notify-only company, matching whole words only.
+
+    The normalized company equals an entry or starts with the entry's words ("Amazon Web
+    Services", "Google DeepMind"; never "Metalab" for Meta). For a single-word entry, a
+    dot-separated label of the URL's host (nvidia.wd5.myworkdayjobs.com) or the board name
+    of an Ashby, Greenhouse or Lever URL (jobs.ashbyhq.com/openai) also matches."""
+    words = norm_company(company).split()
+    host, board = "", ""
+    if url:
+        parts = urlsplit(url.strip())
+        host = (parts.hostname or "").lower()
+        if host.removeprefix("www.") in _BOARD_HOSTS:
+            board = parts.path.strip("/").split("/", 1)[0].casefold()
+    labels = set(host.split(".")) if host else set()
+    for entry in entries:
+        entry_words = norm_company(entry).split()
+        if not entry_words:
+            continue
+        if words[:len(entry_words)] == entry_words:
+            return True
+        if len(entry_words) == 1 and (entry_words[0] in labels or entry_words[0] == board):
+            return True
+    return False
 
 
 def apply_timeout(cfg: Config) -> float:
@@ -457,8 +489,8 @@ class JobScheduler:
         return stored
 
     def _is_notify_only(self, posting: dict) -> bool:
-        company = norm_company(posting.get("company"))
-        return bool(company) and company in {norm_company(c) for c in self._cfg.jobs.notify_only_companies}
+        return is_notify_only_company(posting.get("company"), posting.get("url"),
+                                      self._cfg.jobs.notify_only_companies)
 
     def _notify_only_alert(self, posting: dict) -> str:
         fields = [

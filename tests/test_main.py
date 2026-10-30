@@ -9,7 +9,8 @@ from argus.config import Config
 from argus.config import MailConfig
 from argus.mail.reader import MailReader, MailReaderError
 from argus.mail.watcher import MailWatcher
-from argus.main import backup_loop, build_app
+from argus.jobs.tracker import ApplicationsTracker
+from argus.main import backup_loop, build_app, open_tracker
 from argus.scheduler import day_key
 from tests.mail_fixtures import build_fake_mail
 
@@ -417,10 +418,11 @@ def test_build_app_wires_tracker_and_mail_reader(tmp_path, fake_chat_db, monkeyp
     fm = build_fake_mail(tmp_path)
     cfg = Config(root=tmp_path, self_handles=("+15550000000",), chat_db=fake_chat_db.path)
     cfg.jobs_internships_dir.mkdir(parents=True)
+    ApplicationsTracker(cfg.jobs_internships_dir).migrate()
     app = build_app(cfg, mail_reader_factory=lambda: MailReader(fm.mail_dir, fm.accounts_db))
     try:
         sched = app.job_scheduler
-        assert sched._tracker is not None and sched._tracker.db_path.is_file()  # migrated at startup
+        assert sched._tracker is not None and sched._tracker.db_path.is_file()
         assert sched._tracker.rows() == []
         assert isinstance(sched._apply_fn.keywords["reader"], MailReader)
         assert sched._apply_fn.keywords["relay"] is sched.relay
@@ -437,6 +439,24 @@ def test_build_app_continues_without_tracker(tmp_path, fake_chat_db, monkeypatch
         assert "applications tracker" in caplog.text
     finally:
         app.store.close()
+
+
+def test_open_tracker_refuses_missing_database(tmp_path, caplog):
+    """No applications.db: an empty tracker would make every company look new, so the
+    scheduler gets None (which blocks automatic applies) and nothing is created."""
+    cfg = Config(root=tmp_path, self_handles=("+15550000000",))
+    cfg.jobs_internships_dir.mkdir(parents=True)
+    assert open_tracker(cfg) is None
+    assert not (cfg.jobs_internships_dir / "applications.db").exists()
+    assert "does not exist" in caplog.text
+
+
+def test_open_tracker_opens_existing_database(tmp_path):
+    cfg = Config(root=tmp_path, self_handles=("+15550000000",))
+    cfg.jobs_internships_dir.mkdir(parents=True)
+    ApplicationsTracker(cfg.jobs_internships_dir).migrate()
+    tracker = open_tracker(cfg)
+    assert tracker is not None and tracker.rows() == []
 
 
 def test_build_app_without_jobs_when_disabled(tmp_path, fake_chat_db, monkeypatch):

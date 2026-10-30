@@ -1217,3 +1217,59 @@ async def test_new_run_warns_when_replacing_unsent_run(tmp_path, caplog):
     await env.step()
     assert "jobs run of 2026-10-13 replaced before its summary was sent" in caplog.text
     env.store.close()
+
+
+# --- notify-only name variants ---
+
+TOP = ("Google", "Amazon", "Meta", "Apple", "Microsoft", "Nvidia", "OpenAI")
+
+
+@pytest.mark.parametrize("company", [
+    "Google", "Google LLC", "Amazon Web Services", "Google DeepMind", "Meta Platforms, Inc.",
+    "Microsoft Research", "Amazon.com", "NVIDIA Corporation",
+])
+def test_notify_only_matches_company_name_variants(company):
+    from argus.jobs.scheduler import is_notify_only_company
+    assert is_notify_only_company(company, "https://example.com/job/1", TOP)
+
+
+@pytest.mark.parametrize("company", ["Metalab", "Applebee's", "Googleplex Labs", "Acme", "", None])
+def test_notify_only_matches_whole_words_only(company):
+    from argus.jobs.scheduler import is_notify_only_company
+    assert not is_notify_only_company(company, "https://example.com/job/1", TOP)
+
+
+@pytest.mark.parametrize("url", [
+    "https://nvidia.wd5.myworkdayjobs.com/NVIDIAExternalCareerSite/job/123",
+    "https://jobs.ashbyhq.com/openai/abc-123",
+    "https://boards.greenhouse.io/google/jobs/42",
+    "https://jobs.lever.co/meta/xyz",
+    "https://www.amazon.jobs/en/jobs/1",
+])
+def test_notify_only_matches_url_host_label_or_board(url):
+    from argus.jobs.scheduler import is_notify_only_company
+    assert is_notify_only_company("Some Subsidiary", url, TOP)
+
+
+@pytest.mark.parametrize("url", [
+    "https://metalab.wd1.myworkdayjobs.com/x/job/1",
+    "https://jobs.ashbyhq.com/applebees/1",
+    "https://boards.greenhouse.io/acme/jobs/openai",  # only the first path segment counts
+    "https://example.com/openai/job",  # path segments count only on board hosts
+])
+def test_notify_only_url_needs_exact_label(url):
+    from argus.jobs.scheduler import is_notify_only_company
+    assert not is_notify_only_company("Acme", url, TOP)
+
+
+async def test_notify_only_variant_from_url_is_alerted_not_queued(env):
+    env.clock.at = DAY.replace(hour=7, minute=30)
+    nv = {"company": "Some Lab", "role": "SWE Intern",
+          "url": "https://nvidia.wd5.myworkdayjobs.com/External/job/1", "fit": 5}
+    aws = {"company": "Amazon Web Services", "role": "SDE Intern", "url": U("aws"), "fit": 5}
+    env.scout.results.append(ScoutResult(ok=True, postings=[nv, aws]))
+    await env.step()
+    await env.step()
+    statuses = {r["url"]: r["status"] for r in env.store.list_postings()}
+    assert statuses == {nv["url"]: "notify_only", U("aws"): "notify_only"}
+    assert env.apply.calls == []

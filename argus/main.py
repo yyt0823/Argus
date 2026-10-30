@@ -89,8 +89,15 @@ def import_fitness_logs(cfg: Config, store: Store) -> None:
 
 
 def open_tracker(cfg: Config) -> ApplicationsTracker | None:
-    """The applications tracker, migrated once; None (logged) if it cannot be opened."""
+    """The applications tracker, migrated once; None (logged) if it cannot be opened.
+
+    A missing ``applications.db`` is an error, not a fresh start: an empty tracker would
+    make every company look new and let automatic applies run blind. None blocks them."""
     tracker = ApplicationsTracker(cfg.jobs_internships_dir)
+    if not tracker.db_path.is_file():
+        log.error("jobs: applications tracker %s does not exist; automatic applies are off "
+                  "until it is restored", tracker.db_path)
+        return None
     try:
         tracker.migrate()
     except Exception:
