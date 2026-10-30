@@ -73,17 +73,17 @@ JOBS_SECTION = (
     "\n- Internships: call jobs_list with days 1 and min_fit 3 for new postings found in the last "
     "24 hours (best first, with deadlines; if none, say no new openings were found), jobs_list "
     "with status submitted and days 1 for applications submitted since yesterday, and jobs_list "
-    "with status needs_login, then needs_attestation, then error for applications that need the "
-    "user (with links). Never say an application was submitted unless jobs_list shows status "
+    "with status needs_user, then needs_login, then needs_attestation, then error for applications "
+    "that need the user (with links). Never say an application was submitted unless jobs_list shows status "
     "submitted."
 )
 JOBS_RUNNING_SECTION = (
     "\n- Internships: this morning's internship search is still running; say in one line that "
     "its results will follow in a separate message (do not call jobs_list for new postings and "
     "do not start another search). Then call jobs_list with status submitted and days 1 for "
-    "applications submitted since yesterday, and jobs_list with status needs_login, then "
-    "needs_attestation, then error for applications that need the user (with links). Never say "
-    "an application was submitted unless jobs_list shows status submitted."
+    "applications submitted since yesterday, and jobs_list with status needs_user, then "
+    "needs_login, then needs_attestation, then error for applications that need the user (with "
+    "links). Never say an application was submitted unless jobs_list shows status submitted."
 )
 
 

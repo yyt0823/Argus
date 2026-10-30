@@ -6,8 +6,8 @@
   appended to ``failed`` (if given), never raised.
 - ``apply_email_events``: records every event in ``email_events`` and moves matching application
   rows to a new status (see ``_target_status``); returns notes for events that matched nothing. A
-  rejection naming no role changes a row only when exactly one row of that company is still open;
-  with several open rows it changes nothing and returns a "check by hand" note.
+  rejection or action email naming no role changes a row only when exactly one row of that company
+  is still open; with several open rows it changes nothing and returns a "check by hand" note.
 - ``build_summary_task``: the internal task the chat model turns into ONE iMessage.
 """
 
@@ -192,12 +192,13 @@ def apply_email_events(tracker: ApplicationsTracker, events: list[JobEmail]) -> 
             action=event.action, deadline=event.deadline, mail_rowid=event.mail_id,
         )
         matched = _matches(event, rows)
-        if matched and event.kind == "rejection" and not role_tokens(event.role):
-            # A rejection naming no role is applied only when it cannot be ambiguous.
+        if matched and event.kind in ("rejection", "action") and not role_tokens(event.role):
+            # A rejection or action naming no role is applied only when it cannot be ambiguous.
             still_open = [r for r in matched if r.get("status") not in _TERMINAL]
             if len(still_open) > 1:
                 unmatched.append(
-                    f"rejection from {event.company} names no role; {len(still_open)} open "
+                    f"{'rejection' if event.kind == 'rejection' else 'action email'} from {event.company} "
+                    f"names no role; {len(still_open)} open "
                     f"applications — check by hand ({event.subject})"
                 )
                 continue
@@ -268,14 +269,18 @@ def build_summary_task(
         if lines:
             sections.append(f"{title}:\n" + email_block("\n".join(f"- {x}" for x in lines)))
 
+    notes = _text(run.get("scout_notes"))
+    if notes:
+        sections.append("Search notes (the scout's own summary; mention sources it could not read):\n"
+                        + untrusted_block(notes))
     web("Submitted", [_posting(p) for p in by_status.get("submitted", [])])
     web("Accounts created (sites)", list(accounts_created))
     web("Needs the user (not submitted)",
         [f"[{p.get('status')}] " + _posting(p, detail=True, url=True)
          for s in _NEEDS_YOU for p in by_status.get(s, [])])
     web("Skipped as duplicates",
-        [_posting(p, detail=True) for p in by_status.get("skipped", [])
-         if "duplicate" in (p.get("status_detail") or "")])
+        [_posting(p, detail=True, url="possible duplicate" in (p.get("status_detail") or ""))
+         for p in by_status.get("skipped", []) if "duplicate" in (p.get("status_detail") or "")])
     web("Top-tier openings (Argus never applies; the user may apply)",
         [_posting(p, url=True) for p in by_status.get("notify_only", [])])
     mail("Rejections", [_email(e) for e in events if e.kind == "rejection"])

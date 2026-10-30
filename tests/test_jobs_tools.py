@@ -249,8 +249,8 @@ async def test_job_answer_refused_in_system_turn(env):
 
 
 @pytest.mark.parametrize("result,expected", [
-    ("expired", "That question expired; the application was marked needs_user."),
-    ("unknown", "No such pending question."),
+    ("expired", "That question expired; jobagent stopped waiting for it."),
+    ("unknown", "No such pending question. No questions are pending."),
     ("invalid", "For this request answer exactly 'done' or 'skip'."),
     ("already_answered", "That question was already answered."),
 ])
@@ -260,3 +260,13 @@ async def test_job_answer_replies(env, result, expected):
     with turn_context.turn(system=False, at=NOW):
         r = await t["job_answer"].handler({"question_id": "1-1", "answer": "yes"})
     assert text(r) == expected
+
+
+async def test_job_answer_unknown_lists_pending_ids(env):
+    _, _, sched, t = env
+    sched.relay.answer = lambda qid, text: "unknown"
+    sched.relay.pending = lambda: [{"id": "7-1", "kind": "question", "text": "?", "job_url": ""},
+                                   {"id": "9-2", "kind": "action", "text": "?", "job_url": ""}]
+    with turn_context.turn(system=False, at=NOW):
+        r = await t["job_answer"].handler({"question_id": "1-1", "answer": "yes"})
+    assert text(r) == "No such pending question. Pending: 7-1, 9-2"

@@ -13,8 +13,10 @@ through this module get ``source='argus'``.
 
 from __future__ import annotations
 
+import os
 import re
 import sqlite3
+import tempfile
 from datetime import date
 from pathlib import Path
 
@@ -201,9 +203,15 @@ class ApplicationsTracker:
         footer = self._footer()
         if footer:
             text += "\n" + footer
-        tmp = self.md_path.with_name(self.md_path.name + ".tmp")
-        tmp.write_text(text, encoding="utf-8")
-        tmp.replace(self.md_path)
+        # A unique temp name in the same directory: concurrent renders never share a temp file.
+        fd, tmp = tempfile.mkstemp(prefix=self.md_path.name + ".", suffix=".tmp", dir=self.md_path.parent)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(text)
+            os.replace(tmp, self.md_path)
+        except BaseException:
+            Path(tmp).unlink(missing_ok=True)
+            raise
 
     def _footer(self) -> str:
         if not self.md_path.exists():

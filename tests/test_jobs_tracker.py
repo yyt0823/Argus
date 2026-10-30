@@ -1,5 +1,6 @@
 import sqlite3
 from datetime import date
+from pathlib import Path
 
 import pytest
 
@@ -104,6 +105,24 @@ def test_render_keeps_manual_footer(tracker):
     assert not tracker.md_path.with_name("ALL_APPLICATIONS.md.tmp").exists()
     tracker.render_markdown()  # re-render is stable
     assert tracker.md_path.read_text(encoding="utf-8") == text
+
+
+def test_render_uses_unique_temp_files_and_leaves_none(tracker, monkeypatch):
+    import argus.jobs.tracker as mod
+    tracker.migrate()
+    temps = []
+    real = mod.os.replace
+
+    def spy(src, dst):
+        temps.append(str(src))
+        real(src, dst)
+
+    monkeypatch.setattr(mod.os, "replace", spy)
+    tracker.render_markdown()
+    tracker.render_markdown()
+    assert len(set(temps)) == 2  # each render has its own temp file
+    assert all(t.endswith(".tmp") and Path(t).parent == tracker.md_path.parent for t in temps)
+    assert sorted(p.name for p in tracker.md_path.parent.iterdir() if p.suffix == ".tmp") == []
 
 
 def test_render_without_footer(tracker):

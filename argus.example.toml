@@ -75,6 +75,7 @@ self_handles = ["+15550000000"]
 # internships_dir = "data/about_me/internships"
 # resume_path = "data/about_me/yantian_yin_cv.pdf"
 # cli_path = "/opt/homebrew/bin/claude"   # unused since applications moved to jobagent
+# apply_budget_usd = 2.0            # unused since applications moved to jobagent
 # jobagent_dir = "~/Desktop/side_project/job_finding_agent"   # the jobagent checkout that applies
 # jobagent_profile = "config/profile.yaml"   # relative to jobagent_dir
 # jobagent_model = "..."             # unset: jobagent's default model

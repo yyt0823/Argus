@@ -64,7 +64,7 @@ class JobsConfig:
     min_fit_apply: int = 4  # on the tracker's 1-5 scale
     daily_apply_limit: int = 8  # automatic submissions per day; automatic runs are capped at twice this
     scout_budget_usd: float = 3.0  # max_budget_usd of one scout run
-    apply_budget_usd: float = 2.0  # max_budget_usd of one application run
+    apply_budget_usd: float = 2.0  # unused since applications moved to jobagent (still accepted)
     apply_window: tuple[time, time] = (time(8, 30), time(22, 0))
     internships_dir: str = "data/about_me/internships"
     resume_path: str = "data/about_me/yantian_yin_cv.pdf"

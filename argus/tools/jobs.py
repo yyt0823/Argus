@@ -251,11 +251,13 @@ def build_jobs_tools(
         if result == "sent":
             return _ok("Passed to jobagent.")
         if result == "expired":
-            return _ok("That question expired; the application was marked needs_user.")
+            return _ok("That question expired; jobagent stopped waiting for it.")
         if result == "invalid":
             return _ok("For this request answer exactly 'done' or 'skip'.")
         if result == "already_answered":
             return _ok("That question was already answered.")
-        return _ok("No such pending question.")
+        pending = await asyncio.to_thread(scheduler.relay.pending)
+        ids = ", ".join(q["id"] for q in pending)
+        return _ok("No such pending question. " + (f"Pending: {ids}" if ids else "No questions are pending."))
 
     return [jobs_scout_now, jobs_list, job_apply, job_skip, jobs_followups, job_answer]

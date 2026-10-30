@@ -681,8 +681,8 @@ def test_apply_timeout_covers_jobagent_and_human_wait(tmp_path):
     from argus.config import Config, JobsConfig
     from argus.jobs.scheduler import apply_timeout
     cfg = Config(root=tmp_path, self_handles=("+15555550100",))
-    assert apply_timeout(cfg) == (30 + 30 + 15) * 60
-    assert apply_timeout(replace(cfg, jobs=JobsConfig(human_timeout_minutes=5))) == 50 * 60
+    assert apply_timeout(cfg) == (30 + 2 * 30 + 15) * 60
+    assert apply_timeout(replace(cfg, jobs=JobsConfig(human_timeout_minutes=5))) == 55 * 60
 
 
 # --- v2: notify-only, dedup, preflight, tracker, quiet alerts ---
@@ -1306,3 +1306,21 @@ async def test_requested_posting_matching_interrupted_one_applies_with_note(env)
     p = env.store.get_posting(new)
     assert p["status"] == "submitted"
     assert f"possible duplicate of posting #{old} (earlier attempt may have submitted)" in p["status_detail"]
+
+
+# --- scout notes reach the run summary ---
+
+async def test_daily_scout_notes_reach_the_run_summary(tmp_path):
+    env = summary_env(tmp_path, FakeReader(), at=DAY.replace(hour=7, minute=30))
+    notes = "Searched Reddit and LinkedIn. Xiaohongshu needed a login. " + "x" * 1000
+    env.scout.results.append(ScoutResult(ok=True, summary=notes))
+    await env.step()
+    assert run_state(env)["scout_notes"] == notes[:800]
+    env.clock.at = DAY.replace(hour=7, minute=31)
+    await env.step()
+    env.clock.at = DAY.replace(hour=7, minute=51)
+    await env.step()
+    [text] = summaries(env)
+    assert "Search notes" in text and "Xiaohongshu needed a login." in text
+    assert "x" * 800 not in text and "<untrusted_web>" in text
+    env.store.close()

@@ -281,7 +281,7 @@ async def test_fitness_no_weigh_in_reminder_when_recent_weight(tmp_path):
 async def test_jobs_asks_for_postings_and_applications(tmp_path):
     _, b = await _text(tmp_path, jobs=True)
     assert "jobs_list" in b and "min_fit" in b
-    for status in ("submitted", "needs_login", "needs_attestation"):
+    for status in ("submitted", "needs_user", "needs_login", "needs_attestation", "error"):
         assert status in b
     assert "still running" not in b
 
@@ -294,7 +294,7 @@ async def test_jobs_scout_still_running_says_results_follow(tmp_path):
     (b,) = env.sent
     assert "still running" in b and "results will follow" in b
     assert "min_fit" not in b
-    assert "needs_login" in b
+    assert "needs_user" in b and "needs_login" in b
 
 
 async def test_scout_running_check_error_is_not_fatal(tmp_path):

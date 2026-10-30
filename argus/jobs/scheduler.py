@@ -75,7 +75,8 @@ State keys (``Store.get_state``/``set_state``):
 - ``jobs_interrupted``: comma-separated posting ids interrupted by a shutdown, alerted on the
   next start.
 - ``jobs_run``: JSON ``{"day", "started_at", "mail_after_id", "scout_done", "work_done_at",
-  "summary_sent", "accounts_created", "posting_ids"}`` for the latest daily run.
+  "summary_sent", "accounts_created", "posting_ids", "scout_notes"}`` for the latest daily run
+  (``scout_notes``: the scout's summary, at most ``SCOUT_NOTES_CHARS``, set when it finishes).
 """
 
 from __future__ import annotations
@@ -113,6 +114,7 @@ QUEUE_MAX_AGE = timedelta(days=7)
 SCOUT_TIMEOUT = 45 * 60.0  # seconds
 QUEUE_SCAN_LIMIT = 1000
 SUMMARY_MAIL_LIMIT = 500  # inbox messages read for one run summary
+SCOUT_NOTES_CHARS = 800  # of the scout's summary kept for the run summary
 
 
 # ATS hosts whose first path segment is the company's board name (jobs.ashbyhq.com/openai).
@@ -146,8 +148,9 @@ def is_notify_only_company(company: str | None, url: str | None, entries) -> boo
 
 
 def apply_timeout(cfg: Config) -> float:
-    """Seconds one application may take: jobagent's own work, a wait for the user's answer, and slack."""
-    return (30 + cfg.jobs.human_timeout_minutes + 15) * 60.0
+    """Seconds one application may take: jobagent's own work, two waits for the user's answers,
+    and slack."""
+    return (30 + 2 * cfg.jobs.human_timeout_minutes + 15) * 60.0
 
 
 KEY_LAST_SCOUT = "jobs_last_scout"
@@ -451,14 +454,15 @@ class JobScheduler:
             log.exception("scout run raised")
             result = ScoutResult(ok=False, error=f"scout run failed: {e or type(e).__name__}")
         stored: list[dict] = []
+        summary = result.summary if result.ok else f"{result.error or 'failed'}; {result.summary}".rstrip("; ")
         try:
             if result.ok:
                 stored = await self._store_postings(result.postings)
-            summary = result.summary if result.ok else f"{result.error or 'failed'}; {result.summary}".rstrip("; ")
             self._store.finish_job_run(run_id, self._now(), result.ok, summary, result.cost_usd)
             log.info("scout finished: ok=%s, %d posting(s), cost=%s", result.ok, len(stored), result.cost_usd)
         finally:
-            self._note_run(scout_done=True)
+            # The scout's own summary (e.g. sources it could not read) goes into the run summary.
+            self._note_run(scout_done=True, scout_notes=summary[:SCOUT_NOTES_CHARS])
             # A daily scout that finishes after today's briefing went out reports on its own, since
             # the briefing told the user results would follow.
             late_daily = bool(stored) and self._store.get_state("briefing_last_sent") == started.date().isoformat()
@@ -772,7 +776,7 @@ class JobScheduler:
         self._store.set_state(KEY_RUN, json.dumps(run))
 
     def _note_run(self, *, scout_done: bool = False, posting_id: int | None = None,
-                  accounts: tuple[str, ...] = ()) -> None:
+                  accounts: tuple[str, ...] = (), scout_notes: str | None = None) -> None:
         """Record progress in the pending run (if any); never raises."""
         try:
             run = self._run_state()
@@ -780,6 +784,8 @@ class JobScheduler:
                 return
             if scout_done:
                 run["scout_done"] = True
+            if scout_notes is not None:
+                run["scout_notes"] = scout_notes
             if posting_id is not None and posting_id not in run.setdefault("posting_ids", []):
                 run["posting_ids"].append(posting_id)
             created = run.setdefault("accounts_created", [])
