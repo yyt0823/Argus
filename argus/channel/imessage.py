@@ -22,6 +22,16 @@ SEND_SCRIPT = (
     '  tell application "Messages" to send (item 1 of argv) to chat id (item 2 of argv)\n'
     'end run'
 )
+# Contact mode: address the owner's handle on the bot's iMessage account. Sending to a chat id can
+# silently pick SMS (Text Message Forwarding) and send as the owner instead of the bot.
+CONTACT_SEND_SCRIPT = (
+    'on run argv\n'
+    '  tell application "Messages"\n'
+    '    set svc to 1st account whose service type = iMessage\n'
+    '    send (item 1 of argv) to participant (item 2 of argv) of svc\n'
+    '  end tell\n'
+    'end run'
+)
 
 CHECKPOINT_KEY = "imessage_last_rowid"
 REPLY_CHAT_KEY = "imessage_reply_chat"  # contact mode: chat guid of the owner handle that last wrote
@@ -313,7 +323,11 @@ class IMessageChannel(Channel):
                 before = self._max_rowid()
             except sqlite3.Error:
                 log.warning("could not read chat.db before send; skipping guid capture", exc_info=True)
-        args = ["osascript", "-e", SEND_SCRIPT, full, self._reply_chat()]
+        if self.mode == "contact":
+            handle = self._reply_chat().split(";-;", 1)[-1]
+            args = ["osascript", "-e", CONTACT_SEND_SCRIPT, full, handle]
+        else:
+            args = ["osascript", "-e", SEND_SCRIPT, full, self._reply_chat()]
         reason = "unknown error"
         for attempt in range(1, SEND_ATTEMPTS + 1):
             try:

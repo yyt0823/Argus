@@ -2,7 +2,7 @@ import subprocess
 from datetime import datetime, timedelta
 import pytest
 from argus.channel.base import SendError
-from argus.channel.imessage import IMessageChannel, decode_attributed_body, PREFIX, SEND_SCRIPT
+from argus.channel.imessage import IMessageChannel, decode_attributed_body, PREFIX, SEND_SCRIPT, CONTACT_SEND_SCRIPT
 from argus.store import Store
 from tests.conftest import make_attributed_body
 
@@ -233,7 +233,7 @@ def test_contact_send_before_inbound_uses_first_handle(fake_chat_db, store):
     fake_chat_db.add_chat("iMessage;-;" + OWNER_EMAIL)
     c = cchan(fake_chat_db, store, runner, handles=(OWNER_EMAIL, OWNER_PHONE)); c.poll()
     c.send("hi")
-    assert calls == [["osascript", "-e", SEND_SCRIPT, PREFIX + "hi", "iMessage;-;" + OWNER_EMAIL]]
+    assert calls == [["osascript", "-e", CONTACT_SEND_SCRIPT, PREFIX + "hi", OWNER_EMAIL]]
 
 def test_contact_reply_goes_to_latest_inbound_chat(fake_chat_db, store):
     calls = []
@@ -247,7 +247,7 @@ def test_contact_reply_goes_to_latest_inbound_chat(fake_chat_db, store):
     fake_chat_db.add("from phone", 0, T0, chat_id=1)
     assert [m.text for m in c.poll()] == ["from phone"]
     c.send("b")
-    assert calls == ["iMessage;-;" + OWNER_EMAIL, "iMessage;-;" + OWNER_PHONE]
+    assert calls == [OWNER_EMAIL, OWNER_PHONE]
 
 def test_contact_reply_chat_persists_across_restart(fake_chat_db, store):
     calls = []
@@ -260,7 +260,7 @@ def test_contact_reply_chat_persists_across_restart(fake_chat_db, store):
     assert store.get_state("imessage_reply_chat") == "iMessage;-;" + OWNER_EMAIL
     c2 = cchan(fake_chat_db, store, runner, handles=(OWNER_PHONE, OWNER_EMAIL))
     c2.send("back")
-    assert calls == ["iMessage;-;" + OWNER_EMAIL]
+    assert calls == [OWNER_EMAIL]
 
 def test_contact_stale_reply_chat_falls_back_to_first_handle(fake_chat_db, store):
     calls = []
@@ -268,7 +268,7 @@ def test_contact_stale_reply_chat_falls_back_to_first_handle(fake_chat_db, store
         calls.append(args[4]); return subprocess.CompletedProcess(args, 0, "", "")
     store.set_state("imessage_reply_chat", "iMessage;-;" + OWNER_EMAIL)  # handle since removed from config
     cchan(fake_chat_db, store, runner).send("x")
-    assert calls == ["iMessage;-;" + OWNER_PHONE]
+    assert calls == [OWNER_PHONE]
 
 def test_contact_send_does_not_capture_guid_or_drop_inbound(fake_chat_db, store):
     def runner(args):
