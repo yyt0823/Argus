@@ -124,3 +124,33 @@ def test_render_counts_by_region(tracker):
     assert "| 3 | 10-05 | Odd Region Ltd |" in text
     assert "| C1 | before 10-17 | Initech CN |" in text
     assert "| C2 | 10-17 | Umbrella CN |" in text
+
+
+def test_migrate_backfills_source_after_partial_migration(tracker):
+    con = sqlite3.connect(tracker.db_path)
+    con.execute("ALTER TABLE applications ADD COLUMN source TEXT")  # crashed before the backfill
+    con.commit()
+    con.close()
+    tracker.migrate()
+    assert {r["source"] for r in tracker.rows()} == {"tracker"}
+
+
+def test_migrate_adds_unique_mail_rowid_index(tracker):
+    tracker.migrate()
+    con = sqlite3.connect(tracker.db_path)
+    ins = "INSERT INTO email_events(mail_rowid) VALUES(?)"
+    con.execute(ins, (None,))
+    con.execute(ins, (None,))  # NULLs may repeat
+    con.execute(ins, (5,))
+    with pytest.raises(sqlite3.IntegrityError):
+        con.execute(ins, (5,))
+    con.close()
+
+
+def test_migrate_skips_index_when_duplicates_exist(tracker):
+    con = sqlite3.connect(tracker.db_path)
+    con.executemany("INSERT INTO email_events(mail_rowid) VALUES(?)", [(9,), (9,)])
+    con.commit()
+    con.close()
+    tracker.migrate()  # must not raise
+    assert len(tracker.rows()) == 5

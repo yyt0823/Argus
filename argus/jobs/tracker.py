@@ -73,10 +73,26 @@ class ApplicationsTracker:
                     if name in have:
                         continue
                     conn.execute(f"ALTER TABLE applications ADD COLUMN {column}")
-                    if name == "source":
-                        conn.execute("UPDATE applications SET source='tracker'")
+                # ALTER autocommits, so backfill separately and every time: a crash in between
+                # must not leave NULL sources behind.
+                conn.execute("UPDATE applications SET source='tracker' WHERE source IS NULL")
+                self._ensure_mail_rowid_index(conn)
         finally:
             conn.close()
+
+    @staticmethod
+    def _ensure_mail_rowid_index(conn: sqlite3.Connection) -> None:
+        """Make mail_rowid dedup airtight, unless existing data already has duplicates."""
+        dupes = conn.execute(
+            "SELECT 1 FROM email_events WHERE mail_rowid IS NOT NULL"
+            " GROUP BY mail_rowid HAVING count(*) > 1 LIMIT 1"
+        ).fetchone()
+        if dupes:
+            return
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS email_events_mail_rowid ON email_events(mail_rowid)"
+            " WHERE mail_rowid IS NOT NULL"
+        )
 
     def add_application(
         self,
