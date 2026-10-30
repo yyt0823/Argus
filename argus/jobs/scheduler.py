@@ -45,8 +45,10 @@ End-of-run summary (``argus.jobs.summary``): the daily scout start creates the r
 The day's work is done once the scout has finished and no automatic posting is ``applying``, and
 either no automatic posting is ``queued``, the apply window has closed, or the daily automatic
 limit is reached (a run from an earlier day is done as soon as nothing automatic is applying).
-``work_done_at`` is set once; ``summary_mail_wait_minutes`` later (time for confirmation mail)
-the summary runs once in the background (``summary_sent`` is set first): it reads the inbox since
+The check first queues newly scouted postings (``_queue_auto``). ``work_done_at`` is set once;
+``summary_mail_wait_minutes`` later (time for confirmation mail) the check runs again: if work came
+back, ``work_done_at`` is cleared and the wait starts over; otherwise the summary runs once in the
+background (``summary_sent`` is set first; an unexpected failure sends ``SUMMARY_FAILED_TEXT``): it reads the inbox since
 ``mail_after_id`` (skipping mails already in the tracker's ``email_events``), classifies the job
 emails, updates the tracker and submits one internal task. Requested applications neither create
 nor extend a run, but their accounts and postings are noted in a pending run like automatic ones.
@@ -206,6 +208,10 @@ APPLY_ALERT_TEXT = {
         "the user briefly, with the link." + _NOT_SUBMITTED
     ),
 }
+SUMMARY_FAILED_TEXT = (
+    f"{INTERNAL_PREFIX} Today's internship run finished, but its summary could not be built. Tell "
+    "the user briefly in one short message to check the logs (and their inbox / applications tracker)."
+)
 APPLY_ALERT_HEAD = f"{INTERNAL_PREFIX} {{what}} " + _UNTRUSTED_NOTE + "\n"
 
 Submit = Callable[[str], Awaitable[None]]
@@ -379,6 +385,9 @@ class JobScheduler:
 
     async def _start_run(self, now: datetime) -> None:
         """Create today's run state (replacing an earlier day's)."""
+        old = self._run_state()
+        if old is not None and not old.get("summary_sent"):
+            log.warning("jobs run of %s replaced before its summary was sent", old.get("day"))
         mail_after_id = None
         if self._reader is not None:
             try:
@@ -742,6 +751,10 @@ class JobScheduler:
     def _work_done(self, run: dict, now: datetime) -> bool:
         if not run.get("scout_done") and self.scouting:
             return False  # after a restart mid-scout, scout_done stays False: not scouting is enough
+        if self._cfg.jobs.auto_apply:
+            # A scout may have finished since this tick's _queue_auto (e.g. while _maybe_apply
+            # awaited a send): queue its postings first so they count as work left.
+            self._queue_auto(now)
         active = [
             p for status in ("applying", "queued")
             for p in self._store.list_postings(status=status, limit=QUEUE_SCAN_LIMIT)
@@ -770,6 +783,11 @@ class JobScheduler:
             self._save_run(run)
         if now < done_at + timedelta(minutes=self._cfg.jobs.summary_mail_wait_minutes):
             return
+        if not self._work_done(run, now):  # more work came up during the wait: wait for it again
+            log.info("jobs run has work again; summary postponed")
+            run["work_done_at"] = None
+            self._save_run(run)
+            return
         run["summary_sent"] = True  # first: one attempt only
         self._save_run(run)
         self._summary_task = asyncio.create_task(self._summarize(run), name="argus-jobs-summary")
@@ -782,17 +800,20 @@ class JobScheduler:
             events = await classify_job_emails(mails, self._cfg.mail.triage_model, self._email_runner,
                                                failed=failed)
             unmatched: list[str] = []
+            tracker_error = False
             if self._tracker is not None and events:
                 try:
                     unmatched = await asyncio.to_thread(apply_email_events, self._tracker, events)
                 except Exception:
                     log.exception("could not update the applications tracker from job emails")
+                    tracker_error = True
             text = build_summary_task(run, postings, events, unmatched, run.get("accounts_created") or [],
-                                      unclassified=len(failed), mail_error=mail_error)
+                                      unclassified=len(failed), mail_error=mail_error,
+                                      tracker_error=tracker_error)
+            log.info("jobs run summary: %d posting(s), %d job email(s)", len(postings), len(events))
         except Exception:
             log.exception("jobs run summary failed")
-            return
-        log.info("jobs run summary: %d posting(s), %d job email(s)", len(postings), len(events))
+            text = SUMMARY_FAILED_TEXT  # the day is not silently lost
         await self._send(text)
 
     def _run_postings(self, run: dict) -> list[dict]:

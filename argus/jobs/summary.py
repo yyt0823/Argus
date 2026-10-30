@@ -5,7 +5,9 @@
   array; emails that are not job-related are dropped. A failed batch is logged and its emails are
   appended to ``failed`` (if given), never raised.
 - ``apply_email_events``: records every event in ``email_events`` and moves matching application
-  rows to a new status (see ``_target_status``); returns notes for events that matched nothing.
+  rows to a new status (see ``_target_status``); returns notes for events that matched nothing. A
+  rejection naming no role changes a row only when exactly one row of that company is still open;
+  with several open rows it changes nothing and returns a "check by hand" note.
 - ``build_summary_task``: the internal task the chat model turns into ONE iMessage.
 """
 
@@ -190,6 +192,18 @@ def apply_email_events(tracker: ApplicationsTracker, events: list[JobEmail]) -> 
             action=event.action, deadline=event.deadline, mail_rowid=event.mail_id,
         )
         matched = _matches(event, rows)
+        if matched and event.kind == "rejection" and not role_tokens(event.role):
+            # A rejection naming no role is applied only when it cannot be ambiguous.
+            still_open = [r for r in matched if r.get("status") not in _TERMINAL]
+            if len(still_open) > 1:
+                unmatched.append(
+                    f"rejection from {event.company} names no role; {len(still_open)} open "
+                    f"applications — check by hand ({event.subject})"
+                )
+                continue
+            if not still_open:
+                continue  # every application there is already finished: nothing to change
+            matched = still_open
         if not matched:
             unmatched.append(
                 f"{event.company or '?'} — {event.role or '?'}: {event.kind} email "
@@ -238,6 +252,7 @@ def build_summary_task(
     *,
     unclassified: int = 0,
     mail_error: bool = False,
+    tracker_error: bool = False,
 ) -> str:
     """The internal task for the end-of-run iMessage."""
     by_status: dict[str, list[dict]] = {}
@@ -277,6 +292,8 @@ def build_summary_task(
         )
     if mail_error:
         sections.append("The mailbox could not be read, so today's job emails are not included.")
+    if tracker_error:
+        sections.append("Updating the applications tracker from these emails failed; it may be incomplete.")
     if not sections:
         sections.append("Nothing was submitted and no job emails arrived.")
     head = SUMMARY_HEAD.format(started=_text(run.get("started_at")) or run.get("day") or "today")

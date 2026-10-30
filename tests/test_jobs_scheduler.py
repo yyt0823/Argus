@@ -1124,3 +1124,96 @@ async def test_summary_without_tracker_and_failed_classification(tmp_path, caplo
     assert "1 email(s)" in text
     assert "model down" in caplog.text
     env.store.close()
+
+
+async def test_work_not_done_when_scout_finishes_during_apply_send(tmp_path):
+    env = summary_env(tmp_path, FakeReader(), at=DAY.replace(hour=9))
+    env.scout.gate = asyncio.Event()
+    env.scout.results = [ScoutResult(ok=True, summary="1", postings=[
+        {"url": U("fresh"), "fit": 5, "company": "Fresh Co", "role": "SWE Intern"}])]
+    # A requested duplicate makes _maybe_apply send a "skipped" alert; the scout finishes meanwhile.
+    env.tracker.add_application(applied_date=DAY.date(), company="Dup Co", role="SWE Intern",
+                                city="Montréal", start="", url=U("dup"))
+    dup = env.add(U("dup"), fit=2, company="Dup Co")
+    env.sched.request_apply(dup)
+
+    async def submit(text):
+        env.sent.append(text)
+        env.scout.gate.set()
+        await asyncio.gather(env.sched._scout_task)
+
+    env.sched.submit = submit
+    await env.sched.tick()
+    assert env.status(dup) == "skipped" and run_state(env)["scout_done"] is True
+    fresh = [p for p in env.store.list_postings(limit=50) if p["url"] == U("fresh")][0]
+    assert fresh["status"] == "queued"  # queued by the work-done check itself
+    assert run_state(env)["work_done_at"] is None
+    env.store.close()
+
+
+async def test_summary_postponed_when_work_returns_during_wait(tmp_path):
+    env = summary_env(tmp_path, FakeReader(), at=DAY.replace(hour=9))
+    await env.step()
+    env.clock.at = DAY.replace(hour=9, minute=1)
+    await env.step()
+    assert run_state(env)["work_done_at"] is not None
+    env.clock.at = DAY.replace(hour=9, minute=20)
+    auto = env.add(U("late"), fit=5, status="queued")  # e.g. from a scout the user asked for
+    env.preflight_error = "jobagent not found"  # it stays queued
+    env.clock.at = DAY.replace(hour=9, minute=21)
+    await env.step()
+    assert summaries(env) == [] and run_state(env)["work_done_at"] is None
+    assert env.status(auto) == "queued"
+    env.clock.at = DAY.replace(hour=22)
+    await env.step()
+    env.clock.at = DAY.replace(hour=22, minute=20)
+    await env.step()
+    assert len(summaries(env)) == 1
+    env.store.close()
+
+
+async def _finish_run(env):
+    await env.step()
+    env.clock.at = DAY.replace(hour=9, minute=1)
+    await env.step()
+    env.clock.at = DAY.replace(hour=9, minute=21)
+    await env.step()
+
+
+async def test_summary_failure_sends_fallback(tmp_path, monkeypatch, caplog):
+    import argus.jobs.scheduler as scheduler_mod
+
+    def boom(*a, **kw):
+        raise RuntimeError("bad summary")
+
+    monkeypatch.setattr(scheduler_mod, "build_summary_task", boom)
+    env = summary_env(tmp_path, FakeReader(), at=DAY.replace(hour=9))
+    await _finish_run(env)
+    assert env.sent == [scheduler_mod.SUMMARY_FAILED_TEXT]
+    assert "bad summary" in caplog.text and run_state(env)["summary_sent"] is True
+    env.store.close()
+
+
+async def test_tracker_update_failure_is_reported(tmp_path, monkeypatch):
+    import argus.jobs.scheduler as scheduler_mod
+
+    def boom(tracker, events):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(scheduler_mod, "apply_email_events", boom)
+    reader = FakeReader(max_id=100, mails=[_mail(101)])
+    runner = FakeEmailRunner(json.dumps([{"id": 101, "job_related": True, "kind": "update",
+                                          "company": "Acme", "summary": "next round"}]))
+    env = summary_env(tmp_path, reader, runner, at=DAY.replace(hour=9))
+    await _finish_run(env)
+    [text] = summaries(env)
+    assert "tracker" in text and "failed" in text and "next round" in text
+    env.store.close()
+
+
+async def test_new_run_warns_when_replacing_unsent_run(tmp_path, caplog):
+    env = summary_env(tmp_path, FakeReader(), at=DAY.replace(hour=9))
+    env.store.set_state("jobs_run", json.dumps({"day": "2026-10-13", "summary_sent": False}))
+    await env.step()
+    assert "jobs run of 2026-10-13 replaced before its summary was sent" in caplog.text
+    env.store.close()
