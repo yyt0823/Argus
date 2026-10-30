@@ -148,6 +148,72 @@ async def test_command_line(env):
     assert "fake jobagent log" in (env.run_dir / "jobagent.log").read_text()
 
 
+async def test_prior_attempt_passes_note(env):
+    posting = {**POSTING, "status_detail": "requested; prior attempt"}
+    await apply_with_jobagent(env.cfg, posting, reader=None, relay=None, run_dir=env.run_dir,
+                              spawn=env.make_spawn(result={"status": "already_applied"}))
+    (cmd, _), = env.calls
+    i = cmd.index("apply")
+    assert list(cmd[i:i + 6]) == ["apply", POSTING["url"], "--note", mod.PRIOR_ATTEMPT_NOTE, "--mode", "auto"]
+    assert "report already_applied and do not submit again" in mod.PRIOR_ATTEMPT_NOTE
+    argv = env.read_probe()["argv"]  # what jobagent received
+    j = argv.index("apply")
+    assert argv[j:j + 4] == ["apply", POSTING["url"], "--note", mod.PRIOR_ATTEMPT_NOTE]
+
+
+async def test_no_note_without_prior_attempt(env):
+    posting = {**POSTING, "status_detail": "requested"}
+    await apply_with_jobagent(env.cfg, posting, reader=None, relay=None, run_dir=env.run_dir,
+                              spawn=env.make_spawn(result={"status": "submitted"}))
+    (cmd, _), = env.calls
+    assert "--note" not in cmd
+
+
+async def test_run_end_expires_unanswered_requests(env):
+    human = env.run_dir / "human"
+    human.mkdir(parents=True)
+    for n in (1, 2):
+        (human / f"q-{n}.json").write_text(json.dumps({"id": n, "kind": "question", "text": "?"}))
+    (human / "a-1.json").write_text('{"answer": "yes"}')
+    await apply_with_jobagent(env.cfg, POSTING, reader=None, relay=None, run_dir=env.run_dir,
+                              spawn=env.make_spawn(result={"status": "failed"}))
+    assert not (human / "q-1.expired").exists()
+    assert (human / "q-2.expired").exists()
+
+
+async def test_cancelled_run_expires_requests_and_deletes_mail(env):
+    task = asyncio.create_task(apply_with_jobagent(
+        env.cfg, POSTING, reader=None, relay=None, run_dir=env.run_dir, spawn=env.make_spawn(sleep=60)))
+    while not env.probe.exists():
+        await asyncio.sleep(0.05)
+    (env.run_dir / "human" / "q-3.json").write_text('{"id": 3}')
+    (env.run_dir / "mail" / "1.json").write_text("{}")
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert (env.run_dir / "human" / "q-3.expired").exists()
+    assert not (env.run_dir / "mail").exists()
+
+
+async def test_late_answer_to_expired_run_is_rejected(env):
+    from argus.jobs.human_relay import EXPIRED, HumanRelay
+
+    sent = []
+
+    async def submit(text):
+        sent.append(text)
+
+    relay = HumanRelay(submit)
+    human = env.run_dir / "human"
+    human.mkdir(parents=True)
+    (human / "q-1.json").write_text(json.dumps({"id": 1, "kind": "question", "text": "?"}))
+    await relay._scan(human, POSTING)
+    await apply_with_jobagent(env.cfg, POSTING, reader=None, relay=None, run_dir=env.run_dir,
+                              spawn=env.make_spawn(result={"status": "failed"}))
+    assert relay.answer("7-1", "late") == EXPIRED
+    assert not (human / "a-1.json").exists()
+
+
 async def test_command_without_model(env, tmp_path):
     from dataclasses import replace
     cfg = replace(env.cfg, jobs=replace(env.cfg.jobs, jobagent_model=None))
@@ -163,7 +229,8 @@ async def test_env_points_to_live_dir_and_run_mail_dir(env):
     probe = env.read_probe()
     assert probe["env"] == {"JOBAGENT_DATA_DIR": str(env.tmp / "ja" / "data" / "live"),
                             "JOBAGENT_MAIL_DIR": str(env.run_dir / "mail")}
-    assert (env.run_dir / "mail").is_dir() and (env.run_dir / "human").is_dir()
+    assert (env.run_dir / "human").is_dir()
+    assert not (env.run_dir / "mail").exists()  # copies of the user's inbox are deleted after the run
 
 
 async def test_default_run_dir_under_live_argus(env):

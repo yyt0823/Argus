@@ -1,9 +1,9 @@
 """Apply to one posting by running jobagent (a separate project) as a subprocess.
 
 jobagent registers accounts, logs in, verifies email, fills and submits the application. While it
-runs, Argus copies new Mail.app messages into the run's ``mail/`` directory (``JOBAGENT_MAIL_DIR``)
-and relays jobagent's questions from ``human/`` to the user. The outcome comes back as the
-``--result-file`` JSON and is mapped onto Argus's ``ApplyResult``.
+runs, Argus copies new Mail.app messages into the run's ``mail/`` directory (``JOBAGENT_MAIL_DIR``,
+deleted when the run ends) and relays jobagent's questions from ``human/`` to the user. The
+outcome comes back as the ``--result-file`` JSON and is mapped onto Argus's ``ApplyResult``.
 """
 
 from __future__ import annotations
@@ -13,6 +13,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import signal
 import subprocess
 from datetime import datetime
@@ -21,7 +22,7 @@ from typing import Any, Protocol
 
 from argus.config import Config
 from argus.jobs.agent import opt_str
-from argus.jobs.applier import ApplyResult
+from argus.jobs.applier import PRIOR_ATTEMPT, ApplyResult
 from argus.jobs.mail_bridge import run_bridge
 from argus.mail.reader import MailReader
 
@@ -42,6 +43,11 @@ TEST_PROFILE_MARKER = "test-profile"
 KILL_GRACE_S = 10.0  # after SIGTERM, before SIGKILL
 DETAIL_MAX = 500
 LOG_TAIL = 300
+# Passed as ``apply --note`` when an earlier run of this posting may already have submitted.
+PRIOR_ATTEMPT_NOTE = (
+    "A previous attempt may already have submitted this application: check the site and the "
+    "confirmation email first; if it was submitted, report already_applied and do not submit again."
+)
 
 # The indented lines after a top-level ``<name>:`` key, and the ``email:`` value among them.
 _BLOCK = r"^{name}:[ \t]*(?:#.*)?\n((?:(?:[ \t]+.*|[ \t]*)(?:\n|$))*)"
@@ -172,6 +178,18 @@ async def _cancel_all(tasks: list[asyncio.Task]) -> None:
             log.error("jobagent helper %s failed", t.get_name(), exc_info=outcome)
 
 
+def _expire_unanswered(human_dir: Path) -> None:
+    """Write ``q-<n>.expired`` for every request without an answer, so a late reply to a
+    stopped run is told "expired" instead of writing an answer nobody reads."""
+    for q in human_dir.glob("q-*.json"):
+        n = q.name.removeprefix("q-").removesuffix(".json")
+        if not (human_dir / f"a-{n}.json").exists():
+            try:
+                (human_dir / f"q-{n}.expired").touch()
+            except OSError:
+                log.exception("could not expire human request %s", q)
+
+
 async def apply_with_jobagent(
     cfg: Config,
     posting: dict,
@@ -184,7 +202,10 @@ async def apply_with_jobagent(
     """Run one jobagent application for ``posting`` and map its result.
 
     Cancellation stops jobagent's whole process group and re-raises. If ``preflight`` fails,
-    jobagent is not started and the result is ``error`` with the reason.
+    jobagent is not started and the result is ``error`` with the reason. If ``PRIOR_ATTEMPT`` is
+    in the posting's ``status_detail``, jobagent gets ``--note PRIOR_ATTEMPT_NOTE``. When the run
+    ends (any way), unanswered human requests are marked expired and the ``mail/`` directory is
+    deleted.
     """
     refused = preflight(cfg)
     if refused is not None:
@@ -203,7 +224,9 @@ async def apply_with_jobagent(
         "--human-dir", str(human_dir),
         "--human-timeout", str(cfg.jobs.human_timeout_minutes * 60),
         *(["--model", cfg.jobs.jobagent_model] if cfg.jobs.jobagent_model else []),
-        "apply", posting["url"], "--mode", "auto", "--result-file", str(result_file),
+        "apply", posting["url"],
+        *(["--note", PRIOR_ATTEMPT_NOTE] if PRIOR_ATTEMPT in (posting.get("status_detail") or "") else []),
+        "--mode", "auto", "--result-file", str(result_file),
     ]
     env = {**os.environ, "JOBAGENT_DATA_DIR": str(cfg.jobagent_live_dir), "JOBAGENT_MAIL_DIR": str(mail_dir)}
     after_id = await asyncio.to_thread(reader.max_id) if reader is not None else 0
@@ -227,4 +250,7 @@ async def apply_with_jobagent(
         _kill_group(proc.pid)
     finally:
         await _cancel_all(tasks)
+        _expire_unanswered(human_dir)
+        # The run's copies of the user's inbox are not needed once jobagent has stopped.
+        shutil.rmtree(mail_dir, ignore_errors=True)
     return read_result(result_file, log_path)

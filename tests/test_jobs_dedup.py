@@ -124,3 +124,29 @@ def test_dedup_req_id_formats_compare_by_digits():
     assert check_duplicate(posting, rows, [], []).kind == "duplicate"
     rows = [_row(1, "Intact", "Intern", req="r155233"), _row(2, "Intact", "Intern", req="155234")]
     assert check_duplicate(posting, rows, [], []).kind == "duplicate"
+
+
+def test_dedup_uncertain_posting_same_url_is_only_possible():
+    posting = {"company": "Acme", "role": "SWE Intern", "url": "https://jobs.example.com/p/42"}
+    uncertain = [{"id": 9, "company": "Acme", "role": "SWE Intern", "url": "https://jobs.example.com/p/42"}]
+    v = check_duplicate(posting, [], [], [], uncertain)
+    assert v == DupVerdict("possible", "posting #9 (earlier attempt may have submitted)")
+
+
+def test_dedup_uncertain_posting_similar_role_is_possible():
+    posting = {"company": "Acme Inc", "role": "Backend Developer Intern", "url": "https://a.com/1"}
+    uncertain = [{"id": 3, "company": "Acme", "role": "Backend Developer", "url": "https://a.com/2"}]
+    assert check_duplicate(posting, [], [], [], uncertain).kind == "possible"
+
+
+def test_dedup_uncertain_posting_unrelated_is_none():
+    posting = {"company": "Acme", "role": "SWE Intern", "url": "https://a.com/1"}
+    uncertain = [{"id": 3, "company": "Other", "role": "SWE Intern", "url": "https://b.com/2"}]
+    assert check_duplicate(posting, [], [], [], uncertain).kind == "none"
+
+
+def test_dedup_certain_duplicate_beats_uncertain_match():
+    posting = {"company": "Acme", "role": "SWE Intern", "url": "https://a.com/1"}
+    uncertain = [{"id": 3, "company": "Acme", "role": "SWE Intern", "url": "https://a.com/1"}]
+    rows = [_row(5, "Acme", "SWE Intern", url="https://a.com/1")]
+    assert check_duplicate(posting, rows, [], [], uncertain).kind == "duplicate"

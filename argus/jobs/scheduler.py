@@ -23,7 +23,8 @@ Older rows are covered too: ``_queue_auto`` turns a ``new`` notify-only posting 
 company") instead of applied.
 
 Before a posting becomes ``applying``, ``dedup.check_duplicate`` compares it with the
-applications tracker, earlier Argus submissions and jobagent's own log. A ``duplicate`` is
+applications tracker, earlier Argus submissions and jobagent's own log (and, as at most a
+``possible`` duplicate, ``error`` postings that were interrupted or timed out). A ``duplicate`` is
 ``skipped`` ("duplicate of ...") and never applied; a ``possible`` duplicate is ``skipped``
 ("possible duplicate of ...") unless the user requested it explicitly, in which case it is applied
 and the note is added to the result detail. Skips are not runs. If there is no tracker, or the
@@ -55,8 +56,9 @@ emails, updates the tracker and submits one internal task. Requested application
 nor extend a run, but their accounts and postings are noted in a pending run like automatic ones.
 
 An application ``error`` is never retried automatically (a failed run may still have
-submitted). The user can re-request it with ``job_apply``; the applier is then told to check
-for an earlier submission first (``PRIOR_ATTEMPT`` in ``status_detail``).
+submitted). The user can re-request it with ``job_apply``; ``PRIOR_ATTEMPT`` is then put in
+``status_detail`` and ``jobagent_applier`` passes jobagent an ``apply --note`` telling it to check
+the site and the confirmation email for an earlier submission first.
 
 The scout and the applier are long SDK runs, so each runs as a background task; at most one
 of each at a time. Results that need the user become internal tasks through ``submit``; web-
@@ -619,8 +621,10 @@ class JobScheduler:
         self._store.set_posting_status(posting["id"], "applying", detail=posting["status_detail"])
         self._apply_task = asyncio.create_task(self._apply(posting, note), name="argus-jobs-apply")
 
-    def _dedup_sources(self) -> tuple[tuple[list[dict], list[dict], list[dict]], bool]:
-        """(tracker rows, submitted postings, jobagent log entries) for ``check_duplicate``, and
+    def _dedup_sources(self) -> tuple[tuple[list[dict], list[dict], list[dict], list[dict]], bool]:
+        """(tracker rows, submitted postings, jobagent log entries, uncertain postings) for
+        ``check_duplicate`` (uncertain: ``error`` postings interrupted or timed out, which may
+        have submitted), and
         whether the tracker and jobagent's log could both be read (a missing tracker or an
         unreadable source counts as empty and makes the check incomplete). Problems are logged
         when they start and when they clear, not every tick."""
@@ -645,7 +649,11 @@ class JobScheduler:
             log.warning("duplicate check source recovered (was: %s)", what)
         self._dedup_problems = frozenset(problems)
         submitted = self._store.list_postings(status="submitted", limit=QUEUE_SCAN_LIMIT)
-        return (tracker_rows, submitted, jobagent_entries), not problems
+        uncertain = [
+            p for p in self._store.list_postings(status="error", limit=QUEUE_SCAN_LIMIT)
+            if (p.get("status_detail") or "").startswith((INTERRUPTED_DETAIL, TIMED_OUT_DETAIL))
+        ]
+        return (tracker_rows, submitted, jobagent_entries, uncertain), not problems
 
     async def _apply(self, posting: dict, note: str = "") -> None:
         """One application run. The posting's status is always resolved (never left

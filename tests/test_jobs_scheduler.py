@@ -1273,3 +1273,36 @@ async def test_notify_only_variant_from_url_is_alerted_not_queued(env):
     statuses = {r["url"]: r["status"] for r in env.store.list_postings()}
     assert statuses == {nv["url"]: "notify_only", U("aws"): "notify_only"}
     assert env.apply.calls == []
+
+
+# --- possibly-submitted postings in the duplicate check ---
+
+@pytest.mark.parametrize("detail", ["interrupted during application — check manually", "timed out"])
+async def test_interrupted_or_timed_out_posting_is_possible_duplicate(env, detail):
+    _scouted(env)
+    old = env.add(U("old"), fit=5, company="Acme", role="SWE Intern", status="error", detail=detail)
+    new = env.add(U("new"), fit=5, company="Acme", role="SWE Intern")
+    await env.step()
+    p = env.store.get_posting(new)
+    assert p["status"] == "skipped"
+    assert p["status_detail"] == f"possible duplicate of posting #{old} (earlier attempt may have submitted)"
+    assert env.apply.calls == []
+
+
+async def test_other_error_postings_are_not_dedup_sources(env):
+    _scouted(env)
+    env.add(U("old"), fit=5, company="Acme", role="SWE Intern", status="error", detail="jobagent: failed")
+    new = env.add(U("new"), fit=5, company="Acme", role="SWE Intern")
+    await env.step()
+    assert env.status(new) == "submitted"
+
+
+async def test_requested_posting_matching_interrupted_one_applies_with_note(env):
+    _scouted(env)
+    old = env.add(U("old"), fit=5, company="Acme", role="SWE Intern", status="error", detail="timed out")
+    new = env.add(U("new"), fit=5, company="Acme", role="SWE Intern")
+    env.sched.request_apply(new)
+    await env.step()
+    p = env.store.get_posting(new)
+    assert p["status"] == "submitted"
+    assert f"possible duplicate of posting #{old} (earlier attempt may have submitted)" in p["status_detail"]

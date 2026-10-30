@@ -1,7 +1,7 @@
 """Duplicate check: never apply twice to the same job.
 
 ``check_duplicate`` is a pure function over the applications tracker, earlier
-Argus submissions and jobagent's own log. The normalisation helpers are public
+Argus submissions, jobagent's own log and earlier Argus runs that may have submitted. The normalisation helpers are public
 because later tasks reuse them.
 """
 
@@ -146,7 +146,10 @@ def check_duplicate(
     tracker_rows: list[dict],
     submitted_postings: list[dict],
     jobagent_entries: list[dict],
+    uncertain_postings: list[dict] = (),
 ) -> DupVerdict:
+    """``uncertain_postings`` are earlier Argus postings whose run may or may not have submitted
+    (interrupted or timed out): a match against one is at most ``possible``, never ``duplicate``."""
     possible: DupVerdict | None = None
     for cand in _candidates(tracker_rows, submitted_postings, jobagent_entries):
         kind = _compare(posting, cand)
@@ -156,4 +159,9 @@ def check_duplicate(
         if kind == "duplicate":
             return DupVerdict("duplicate", detail)
         possible = possible or DupVerdict("possible", detail)
+    if possible is None:
+        for p in uncertain_postings:
+            cand = {"url": p.get("url"), "company": p.get("company"), "role": p.get("role"), "req": None}
+            if _compare(posting, cand) != "none":
+                return DupVerdict("possible", f"posting #{p.get('id')} (earlier attempt may have submitted)")
     return possible or DupVerdict("none", "")
