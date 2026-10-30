@@ -118,7 +118,7 @@ SCOUT_NOTES_CHARS = 800  # of the scout's summary kept for the run summary
 
 
 # ATS hosts whose first path segment is the company's board name (jobs.ashbyhq.com/openai).
-_BOARD_HOSTS = ("jobs.ashbyhq.com", "boards.greenhouse.io", "jobs.lever.co")
+_BOARD_HOSTS = ("jobs.ashbyhq.com", "boards.greenhouse.io", "job-boards.greenhouse.io", "jobs.lever.co")
 
 
 def is_notify_only_company(company: str | None, url: str | None, entries) -> bool:
@@ -131,9 +131,12 @@ def is_notify_only_company(company: str | None, url: str | None, entries) -> boo
     words = norm_company(company).split()
     host, board = "", ""
     if url:
-        parts = urlsplit(url.strip())
-        host = (parts.hostname or "").lower()
-        if host.removeprefix("www.") in _BOARD_HOSTS:
+        try:
+            parts = urlsplit(url.strip())
+            host = (parts.hostname or "").lower()
+        except ValueError:  # e.g. "https://[bad/x" (invalid IPv6): no host, names still match
+            parts, host = None, ""
+        if parts is not None and host.removeprefix("www.") in _BOARD_HOSTS:
             board = parts.path.strip("/").split("/", 1)[0].casefold()
     labels = set(host.split(".")) if host else set()
     for entry in entries:

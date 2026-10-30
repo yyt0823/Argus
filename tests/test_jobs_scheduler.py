@@ -1243,6 +1243,7 @@ def test_notify_only_matches_whole_words_only(company):
     "https://nvidia.wd5.myworkdayjobs.com/NVIDIAExternalCareerSite/job/123",
     "https://jobs.ashbyhq.com/openai/abc-123",
     "https://boards.greenhouse.io/google/jobs/42",
+    "https://job-boards.greenhouse.io/openai/jobs/7",
     "https://jobs.lever.co/meta/xyz",
     "https://www.amazon.jobs/en/jobs/1",
 ])
@@ -1324,3 +1325,22 @@ async def test_daily_scout_notes_reach_the_run_summary(tmp_path):
     assert "Search notes" in text and "Xiaohongshu needed a login." in text
     assert "x" * 800 not in text and "<untrusted_web>" in text
     env.store.close()
+
+
+@pytest.mark.parametrize("company, expected", [("Google DeepMind", True), ("Acme", False)])
+def test_notify_only_malformed_url_falls_back_to_name(company, expected):
+    from argus.jobs.scheduler import is_notify_only_company
+    assert is_notify_only_company(company, "https://[bad/x", TOP) is expected
+
+
+async def test_malformed_url_posting_does_not_break_scout_or_ticks(env):
+    env.clock.at = DAY.replace(hour=7, minute=30)
+    bad = {"company": "Acme Bad", "role": "SWE Intern", "url": "https://[bad/x", "fit": 5}
+    good = {"company": "Acme Good", "role": "SWE Intern", "url": U("good"), "fit": 5}
+    env.scout.results.append(ScoutResult(ok=True, postings=[bad, good]))
+    await env.step()
+    assert {r["url"] for r in env.store.list_postings()} == {bad["url"], U("good")}
+    env.clock.at = DAY.replace(hour=9)
+    await env.step()  # _queue_auto and the apply step see the malformed URL without raising
+    await env.step()
+    assert U("good") in [c["url"] for c in env.apply.calls]
