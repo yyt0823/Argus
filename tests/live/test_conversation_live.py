@@ -156,20 +156,20 @@ class World:
 
 def build_mail(root: Path, store: Store, now: datetime) -> MailReader:
     fm = build_fake_mail(root / "mail")
-    fm.add_account(ACC_SCHOOL, description="McGill", username="student@mail.mcgill.ca")
+    fm.add_account(ACC_SCHOOL, description="School", username="student@university.example")
     fm.add_account(ACC_PERSONAL, description="Gmail", username="user@gmail.com")
     school = fm.add_mailbox(f"imap://{ACC_SCHOOL}/INBOX")
     personal = fm.add_mailbox(f"imap://{ACC_PERSONAL}/INBOX")
 
     mails = [
         # (mailbox, account label, sender, name, subject, hours ago, body, triage)
-        (school, "McGill", "smith@mcgill.ca", "Prof. Smith", "COMP 512 midterm moved to Oct 20", 3,
+        (school, "School", "smith@university.example", "Prof. Smith", "COMP 512 midterm moved to Oct 20", 3,
          "Dear class,\n\nThe COMP 512 midterm has been moved to Tuesday, October 20, 6-8 PM, "
-         "in Leacock 132. Coverage is unchanged (lectures 1-12).\n\nBest,\nProf. Smith",
-         dict(important=True, category="school", summary="COMP 512 midterm moved to Oct 20, 6-8 PM, Leacock 132",
+         "in Hall 132. Coverage is unchanged (lectures 1-12).\n\nBest,\nProf. Smith",
+         dict(important=True, category="school", summary="COMP 512 midterm moved to Oct 20, 6-8 PM, Hall 132",
               action="Note the new midterm date", deadline="2026-10-20")),
-        (school, "McGill", "registrar@mcgill.ca", "McGill Registrar", "Winter 2027 registration opens Nov 2", 5,
-         "Registration for Winter 2027 courses opens November 2 on Minerva.",
+        (school, "School", "registrar@university.example", "University Registrar", "Winter 2027 registration opens Nov 2", 5,
+         "Registration for Winter 2027 courses opens November 2 on the student portal.",
          dict(important=False, category="school", summary="Winter 2027 course registration opens Nov 2",
               action=None, deadline=None)),
         (personal, "Gmail", "deals@shopmart.example", "ShopMart", "48-hour flash sale: 60% off", 6,

@@ -11,7 +11,7 @@ Argus reads the user's three mailboxes and:
 
 1. **Daily briefing** — every morning at 08:00, one iMessage summarizing the last 24 hours of email: what needs action (with deadlines), what is worth knowing, and a one-line count of the rest.
 2. **Immediate alerts** — when an important email arrives, a short iMessage within ~5 minutes, outside quiet hours.
-3. **Ask anytime** — the user can ask in iMessage about their email ("any McGill emails about exams this week?"), and Argus searches and reads mail to answer.
+3. **Ask anytime** — the user can ask in iMessage about their email ("any school emails about exams this week?"), and Argus searches and reads mail to answer.
 
 Mailboxes:
 
@@ -19,7 +19,7 @@ Mailboxes:
 |---|---|
 | Gmail account (user's personal address) | Google |
 | Custom-domain address on iCloud Mail | iCloud |
-| McGill university address | Microsoft 365 (Exchange) |
+| University address | Microsoft 365 (Exchange) |
 
 ### Out of scope
 
@@ -122,4 +122,4 @@ Email content is untrusted input (anyone can email the user).
 
 ## 9. User Setup
 
-Add the Gmail (Google) and McGill (Microsoft Exchange) accounts, and the iCloud account if not present, in Mail → Add Account; sync Mail only. Argus verifies all three appear in the index before enabling mail features.
+Add the Gmail (Google) and university (Microsoft Exchange) accounts, and the iCloud account if not present, in Mail → Add Account; sync Mail only. Argus verifies all three appear in the index before enabling mail features.

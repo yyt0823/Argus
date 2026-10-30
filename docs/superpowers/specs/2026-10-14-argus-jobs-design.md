@@ -20,7 +20,7 @@ The user already runs internship search and applications by hand with Claude Cod
 
 Argus runs the same two kinds of agents on a schedule and on request, instead of a new pipeline. This covers Workday (most large employers), which an ATS-API approach would not.
 
-The résumé to upload is `data/about_me/yantian_yin_cv.pdf` (has the current phone number). Contact facts come from `PROFILE.md` / `APPLY_BRIEF.md`, never from older CVs.
+The résumé to upload is `data/about_me/cv.pdf` (has the current phone number). Contact facts come from `PROFILE.md` / `APPLY_BRIEF.md`, never from older CVs.
 
 ## 2. Components
 
@@ -40,7 +40,7 @@ argus/tools/jobs.py   # chat tools
 
 ### Applier agent (apply)
 - `ClaudeSDKClient`/`query()` with `extra_args={"chrome": None}`, `cli_path` = the installed `claude` (`/opt/homebrew/bin/claude`; using the SDK's bundled CLI would repoint the user's Chrome native host into the venv), `setting_sources=[]`, `permission_mode="bypassPermissions"` restricted by `guard.py` (Chrome tools + Read of `APPLY_BRIEF.md`, `PROFILE.md`, `EDUCATION.md`, `WORK_AND_PROJECTS.md`, the résumé path for upload; Write only to `internships/applications/`), `max_turns ≈ 120`, one posting per run, at most one applier at a time.
-- System prompt = `APPLY_BRIEF.md` verbatim, plus: résumé path override to `data/about_me/yantian_yin_cv.pdf`; check the Chrome connection first (`tabs_context_mcp`) and stop with `chrome_not_connected` if the extension isn't connected; never use `select_browser`/`switch_browser` prompts; finish with a JSON block `{company, role, req_id, result: submitted|needs_login|needs_attestation|skipped|error, detail, follow_up, guessed_answers}`.
+- System prompt = `APPLY_BRIEF.md` verbatim, plus: résumé path override to `data/about_me/cv.pdf`; check the Chrome connection first (`tabs_context_mcp`) and stop with `chrome_not_connected` if the extension isn't connected; never use `select_browser`/`switch_browser` prompts; finish with a JSON block `{company, role, req_id, result: submitted|needs_login|needs_attestation|skipped|error, detail, follow_up, guessed_answers}`.
 - The brief's hard rules stay in force (no passwords, no account creation, no attestation ticks, no fabrication, code-writing roles only).
 
 ## 3. Data
@@ -58,7 +58,7 @@ argus/tools/jobs.py   # chat tools
 | `daily_apply_limit` | 8 | Max automatic applications per day |
 | `apply_window` | ["08:30", "22:00"] | Only apply while the user is likely awake (they may need to tick an attestation box) |
 | `internships_dir` | "data/about_me/internships" | |
-| `resume_path` | "data/about_me/yantian_yin_cv.pdf" | |
+| `resume_path` | "data/about_me/cv.pdf" | |
 | `cli_path` | "/opt/homebrew/bin/claude" | CLI used for Chrome |
 
 ## 5. User-facing behavior

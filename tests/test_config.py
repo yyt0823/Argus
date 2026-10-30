@@ -159,7 +159,7 @@ def test_jobs_defaults(tmp_path: Path):
     assert j.apply_window == (time(8, 30), time(22, 0))
     assert j.cli_path == "/opt/homebrew/bin/claude"
     assert cfg.jobs_internships_dir == tmp_path / "data" / "about_me" / "internships"
-    assert cfg.jobs_resume_path == tmp_path / "data" / "about_me" / "yantian_yin_cv.pdf"
+    assert cfg.jobs_resume_path == tmp_path / "data" / "about_me" / "cv.pdf"
     assert cfg.jobs_about_me_dir == tmp_path / "data" / "about_me"
 
 def test_jobs_table_parsed(tmp_path: Path):

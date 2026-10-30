@@ -67,7 +67,7 @@ class JobsConfig:
     apply_budget_usd: float = 2.0  # unused since applications moved to jobagent (still accepted)
     apply_window: tuple[time, time] = (time(8, 30), time(22, 0))
     internships_dir: str = "data/about_me/internships"
-    resume_path: str = "data/about_me/yantian_yin_cv.pdf"
+    resume_path: str = "data/about_me/cv.pdf"
     cli_path: str = "/opt/homebrew/bin/claude"
     jobagent_dir: str = "~/Desktop/side_project/job_finding_agent"
     jobagent_profile: str = "config/profile.yaml"  # relative to jobagent_dir (absolute paths are kept)
