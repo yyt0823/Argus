@@ -15,7 +15,7 @@
 - Never apply twice to the same job. If a duplicate is uncertain, skip it with detail `possible duplicate of <row>`.
 - Never auto-apply to a notify-only company. Default list: Google, Amazon, Meta, Apple, Microsoft, Nvidia, OpenAI.
 - The account password lives only in jobagent's `config/profile.yaml` (gitignored, chmod 600). It never goes in the Argus repo, logs, prompts, memory files or iMessages.
-- Never submit with test data. Refuse a profile path containing `test-profile` or an account email of `me@yyt.email`. Live runs use `JOBAGENT_DATA_DIR=<jobagent>/data/live`.
+- Never submit with test data. Refuse a profile path containing `test-profile` or an account email of `<test account email>`. Live runs use `JOBAGENT_DATA_DIR=<jobagent>/data/live`.
 - No invented facts. Cover letters and free-text answers come only from `PROFILE.md`, `WORK_AND_PROJECTS.md`, `EDUCATION.md` and `APPLY_BRIEF.md`.
 - `SENSITIVE_IDS.md` and `documents/` stay unreadable to every agent (existing `guard.py` rules).
 - Limits kept from v1: fit ≥ 4, ≤ 8 automatic submissions/day, window 08:30–22:00, one application at a time.
@@ -29,7 +29,7 @@
 2. **Argus restarts while jobagent runs.** The posting must become `error` "interrupted", the jobagent process group must be killed, and the posting must never be re-queued. Test: `test_cancel_kills_process_group` (Task 8).
 3. **User replies to an old or unknown question id**, or answers after the 30-minute timeout. `job_answer` must say it expired, not write a stale answer file. Test: `test_answer_after_timeout_is_rejected` (Task 9).
 4. **Mail.app message without a file on disk yet** (`.partial.emlx`, or not downloaded). The export must skip it and retry on the next poll, never crash the run. Test: `test_export_skips_missing_then_picks_up` (Task 7).
-5. **Rejection email whose company matches several rows** (Capital One ×4). The status update must apply only where the role matches, or to all rows when the email names no role. It must never touch a different company that shares a word. Test: `test_email_event_role_disambiguation` (Task 11).
+5. **Rejection email whose company matches several rows** (Company A ×4). The status update must apply only where the role matches, or to all rows when the email names no role. It must never touch a different company that shares a word. Test: `test_email_event_role_disambiguation` (Task 11).
 
 ---
 
@@ -149,9 +149,9 @@ Run tests with `.venv/bin/python -m pytest -q`. Baseline: 941 passed, 5 skipped.
 - Produces: `@dataclass(frozen=True) class DupVerdict: kind: Literal["none","duplicate","possible"]; detail: str`.
 - `def check_duplicate(posting: dict, tracker_rows: list[dict], submitted_postings: list[dict], jobagent_entries: list[dict]) -> DupVerdict` (pure).
 - Helpers: `norm_company(s)` (casefold; drop `inc, ltd, corp, canada, group, technologies` and punctuation; text in parentheses dropped; "RBC" == "Royal Bank of Canada" is NOT handled, so exact normalized match only), `req_id(text)` (regex for `R\d{5,}`, `JR\d+`, `REQ[-_ ]?\d+`, `\b\d{5,7}\b` inside parentheses or `_` URL tails), `norm_url(url)` (lowercase host, drop the fragment and the query except `company`, `jobId`, `gh_jid`; strip trailing `/`).
-- Rules, in order. Same `norm_url` → duplicate. Same company and same req id → duplicate. Same company, both req ids known and different → none. Same company and role token Jaccard ≥ 0.6 (tokens: lowercase words ≥ 2 chars, minus `intern, internship, co, op, coop, 2026, 2027, winter, summer, fall, new, grad`) → `possible` if either req id is missing, otherwise none. Same company and identical normalized role → duplicate. The detail names the matched row: `"tracker #12 Coveo — Backend Developer Intern"` or `"posting #31 …"` or `"jobagent 2026-10-23 CIBC — …"`.
+- Rules, in order. Same `norm_url` → duplicate. Same company and same req id → duplicate. Same company, both req ids known and different → none. Same company and role token Jaccard ≥ 0.6 (tokens: lowercase words ≥ 2 chars, minus `intern, internship, co, op, coop, 2026, 2027, winter, summer, fall, new, grad`) → `possible` if either req id is missing, otherwise none. Same company and identical normalized role → duplicate. The detail names the matched row: `"tracker #12 Company C — Backend Developer Intern"` or `"posting #31 …"` or `"jobagent 2026-10-23 Company D — …"`.
 
-- [ ] **Step 1:** Write tests: `test_dedup_same_url_with_tracking_params`, `test_dedup_same_req_id_different_url`, `test_dedup_different_req_ids_same_role_is_none` (the three Intact R155233/4/5 rows), `test_dedup_similar_role_without_req_is_possible`, `test_dedup_other_company_sharing_word_is_none` ("Capital One" vs "One Inc").
+- [ ] **Step 1:** Write tests: `test_dedup_same_url_with_tracking_params`, `test_dedup_same_req_id_different_url`, `test_dedup_different_req_ids_same_role_is_none` (three rows of one company with req ids R482913/4/5), `test_dedup_similar_role_without_req_is_possible`, `test_dedup_other_company_sharing_word_is_none` ("Vandelay Bank" vs "Bank Inc").
 - [ ] **Step 2:** Run. Expected: FAIL.
 - [ ] **Step 3:** Implement.
 - [ ] **Step 4:** Run the full suite. Expected: PASS.
@@ -186,7 +186,7 @@ Run tests with `.venv/bin/python -m pytest -q`. Baseline: 941 passed, 5 skipped.
 - New `JobsConfig` fields: `jobagent_dir: str = "~/Desktop/side_project/job_finding_agent"`, `jobagent_profile: str = "config/profile.yaml"` (relative to jobagent_dir), `jobagent_model: str | None = None`, `notify_only_companies: tuple[str, ...] = ("Google", "Amazon", "Meta", "Apple", "Microsoft", "Nvidia", "OpenAI")`, `human_timeout_minutes: int = 30`, `summary_mail_wait_minutes: int = 20`. Properties on `Config`: `jobagent_dir: Path`, `jobagent_live_dir: Path` (= `jobagent_dir / "data" / "live"`).
 - `ApplyResult` (in `applier.py`) gains `accounts_created: tuple[str, ...] = ()`, `company: str | None = None`, `role: str | None = None`.
 - `STATUS_MAP = {"submitted": "submitted", "already_applied": "skipped", "needs_input": "needs_user", "blocked": "needs_user", "ready_to_submit": "needs_user", "failed": "error"}`. `already_applied` keeps the detail `"already applied on site"`.
-- `def preflight(cfg) -> str | None`: returns an error string if `bin/jobagent` is missing, if the profile is missing, if the profile path contains `test-profile`, or if the profile's `account.email` is `me@yyt.email` (found with a regex on the `email:` line inside the `account:` block, so Argus does not need PyYAML).
+- `def preflight(cfg) -> str | None`: returns an error string if `bin/jobagent` is missing, if the profile is missing, if the profile path contains `test-profile`, or if the profile's `account.email` is `<test account email>` (found with a regex on the `email:` line inside the `account:` block, so Argus does not need PyYAML).
 - `async def apply_with_jobagent(cfg, posting, *, reader, relay, run_dir: Path | None = None, spawn=asyncio.create_subprocess_exec) -> ApplyResult`:
   - `run_dir` defaults to `cfg.jobagent_live_dir / "argus" / <posting id>-<timestamp>`, with `human/` and `mail/` subdirs.
   - Command: `[<jobagent_dir>/bin/jobagent, "--profile", <profile>, "--human-dir", <run_dir/human>, "--human-timeout", <minutes*60>, *(["--model", m] if m), "apply", url, "--mode", "auto", "--result-file", <run_dir/result.json>]`, with env `JOBAGENT_DATA_DIR=<live dir>` and `JOBAGENT_MAIL_DIR=<run_dir/mail>`. Use `start_new_session=True` and stdout/stderr redirected to `run_dir/jobagent.log`.
@@ -256,7 +256,7 @@ Run tests with `.venv/bin/python -m pytest -q`. Baseline: 941 passed, 5 skipped.
 - `def build_summary_task(run, postings_today, events, unmatched, accounts_created) -> str`: an internal task listing: submitted (company — role), accounts created (site keys), needs you (needs_user/error with detail and link), skipped duplicates, top-tier openings, and notable emails (rejections, OAs/actions with deadlines, confirmations as a count). Web/email text goes in untrusted blocks. It ends with "Send ONE concise message."
 - `accounts_created` is collected from the `ApplyResult`s of that day. Store them in `job_runs.summary` or in the `jobs_run` state, appended per run.
 
-- [ ] **Step 1:** Write tests: `test_classify_parses_and_drops_non_job` (fake runner), `test_email_event_role_disambiguation` (Capital One ×4: an email with role "Pickle" updates one row; an email without a role updates all four; "One Inc" untouched), `test_confirmation_does_not_downgrade_rejected`, `test_summary_runs_once_after_wait` (fake clock: scout done, queue empty → nothing before 20 min, one submit after), `test_summary_after_window_close_with_queue_left`.
+- [ ] **Step 1:** Write tests: `test_classify_parses_and_drops_non_job` (fake runner), `test_email_event_role_disambiguation` (Company A ×4: an email with role "Pickle" updates one row; an email without a role updates all four; a company sharing one of its words untouched), `test_confirmation_does_not_downgrade_rejected`, `test_summary_runs_once_after_wait` (fake clock: scout done, queue empty → nothing before 20 min, one submit after), `test_summary_after_window_close_with_queue_left`.
 - [ ] **Step 2:** Run. Expected: FAIL.
 - [ ] **Step 3:** Implement. Read mail with `reader.inbox_since(mail_after_id)` and `read_body`, prefiltering out messages already in `email_events.mail_rowid`.
 - [ ] **Step 4:** Run the full suite. Expected: PASS.
@@ -286,16 +286,16 @@ These steps change the user's files, not code. Do them in order. Check every ste
 
 - [ ] **Step 1: Back up.** `cp -a ~/Desktop/about_me ~/Desktop/about_me.bak-2026-10-29` and `cp -a ~/Argus-build/data/about_me ~/Argus-build/data/about_me.pre-v2`.
 - [ ] **Step 2: Merge Argus's copy into the Desktop.** The Desktop is newer for every profile file (10-21 vs 09/10-13), so keep the Desktop versions of `PROFILE.md`, `EDUCATION.md`, `WORK_AND_PROJECTS.md`, `OPEN_QUESTIONS.md`, `TIMELINE.md` and `APPLY_BRIEF.md`. Show the user the few lines the Argus copy had that the Desktop lacks (`diff`), and add them only if the user agrees. Copy the files that exist only in Argus's copy: `internships/raw/*_argus.md` and `internships/applications/*_argus_*.md`. In `INTERNSHIPS.md`, append the `## Argus session — 2026-10-14` … `2026-10-29` sections from Argus's copy after the Desktop content. `seen_companies.txt`: the union, keeping order (Desktop first).
-- [ ] **Step 3: Tracker.** Rename `internships/db/build_db.py` → `build_db_2026-10-23_legacy.py`. Then run `ApplicationsTracker.migrate()`. Add Argus's 4 submitted postings (InstaLILY, HeyGen, Steel, Veeda AI), skipping any that `check_duplicate` already finds (InstaLILY and HeyGen are probably in the tracker). Run `render_markdown()`. Check: row count = 177 + newly added, and the status counts are unchanged for old rows.
-- [ ] **Step 4: Point Argus at the Desktop.** In local `argus.toml` `[jobs]`: `internships_dir = "~/Desktop/about_me/internships"`, `resume_path = "~/Desktop/yantian_yin_cv.pdf"`. The repo default stays `data/about_me/...`.
+- [ ] **Step 3: Tracker.** Rename `internships/db/build_db.py` → `build_db_2026-10-23_legacy.py`. Then run `ApplicationsTracker.migrate()`. Add Argus's 4 submitted postings, skipping any that `check_duplicate` already finds (two are probably in the tracker). Run `render_markdown()`. Check: row count = the old count + newly added, and the status counts are unchanged for old rows.
+- [ ] **Step 4: Point Argus at the Desktop.** In local `argus.toml` `[jobs]`: `internships_dir = "~/Desktop/about_me/internships"`, `resume_path = "<résumé path>"`. The repo default stays `data/about_me/...`.
 - [ ] **Step 5: APPLY_BRIEF.md.** Update the hard rules to match the new policy: account creation and login are allowed through jobagent (with the password never typed by a model); PM roles are in scope; top-tier companies are notify-only. Show the user the diff before saving.
 
 ### Task 14: jobagent live profile
 
-- [ ] **Step 1:** Generate `config/profile.yaml` from `PROFILE.md`, `EDUCATION.md`, `WORK_AND_PROJECTS.md` and `APPLY_BRIEF.md` (facts only; leave a field empty when the files do not say). Use `account.email: yantian.yin@mail.mcgill.ca`, `account.password: ""`, `documents.resume: ~/Desktop/yantian_yin_cv.pdf`, and the `cover_letters` section from Task 4. `chmod 600`.
+- [ ] **Step 1:** Generate `config/profile.yaml` from `PROFILE.md`, `EDUCATION.md`, `WORK_AND_PROJECTS.md` and `APPLY_BRIEF.md` (facts only; leave a field empty when the files do not say). Use `account.email: <account email>`, `account.password: ""`, `documents.resume: <résumé path>`, and the `cover_letters` section from Task 4. `chmod 600`.
 - [ ] **Step 2:** The user reviews the profile and types the password into it themselves (`! open -e config/profile.yaml`). Claude never sees or echoes it. Check only with `grep -c 'password: ""'` → 0.
 - [ ] **Step 3:** `JOBAGENT_DATA_DIR=data/live bin/jobagent doctor` → profile ✓, resume ✓, chrome ✓.
-- [ ] **Step 4: Dry run on one real posting** (a Workday posting from `job_postings` with status `new`): `JOBAGENT_DATA_DIR=data/live bin/jobagent --human-dir /tmp/… apply <url> --mode dry-run --result-file …`. The user watches; answer one bridge question by hand. Expected: `ready_to_submit`, and the McGill verification mail is read through `JOBAGENT_MAIL_DIR` if the site sends one.
+- [ ] **Step 4: Dry run on one real posting** (a Workday posting from `job_postings` with status `new`): `JOBAGENT_DATA_DIR=data/live bin/jobagent --human-dir /tmp/… apply <url> --mode dry-run --result-file …`. The user watches; answer one bridge question by hand. Expected: `ready_to_submit`, and the verification mail is read through `JOBAGENT_MAIL_DIR` if the site sends one.
 
 ### Task 15: Deploy
 

@@ -94,7 +94,7 @@ def _req_key(*texts: str | None) -> str | None:
 
 
 def _bare_key(value: str | None) -> str | None:
-    """Key for a stored req id column that may be a bare token such as '155233'."""
+    """Key for a stored req id column that may be a bare token such as '482913'."""
     value = (value or "").strip()
     return (re.sub(r"\D", "", value) or value.casefold()) or None
 

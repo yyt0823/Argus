@@ -34,7 +34,7 @@ v1 already covers search, a tracker, auto-apply and mail reading. v2 changes *ho
    - Sources: Reddit, Xiaohongshu (小红书), LinkedIn, plus anything else where people share openings; company career pages and job boards remain fine. A shared post is followed to the employer's real application URL; the same job seen in several places is one posting.
 4. **G4 – Top-tier companies: notify only.** For a configurable list (default: Google, Amazon, Meta, Apple, Microsoft, Nvidia, OpenAI — *my guess at "Google/Amazon level"; user can edit*), Argus never applies. When a matching role opens it sends an iMessage with the company, role and link, and marks the posting `notify_only`.
 5. **G5 – Cover letters and open questions.** When a form asks for a cover letter or free-text answers ("why us", "describe a project"):
-   - Use an existing letter from `~/Desktop/about_me/internships/applications/` if one fits the role (e.g. `general/…NewGrad.pdf`, `general/…General.pdf`, KPMG AI Builder).
+   - Use an existing letter from `~/Desktop/about_me/internships/applications/` if one fits the role (e.g. `general/…NewGrad.pdf`, `general/…General.pdf`, or a company's own letter).
    - Otherwise write one from the user's real experience only (`PROFILE.md`, `WORK_AND_PROJECTS.md`, `APPLY_BRIEF.md` facts), in a plain, human voice — short sentences, specific details, no stock AI phrasing ("thrilled", "leverage", "passionate about synergies"), no invented facts. Generated letters are saved under `applications/<company>/` so they can be reused and checked.
 6. **G6 – Run summary.** After a run's work is finished (scout + all applications it queued), Argus waits for confirmation mail to arrive, reads the job-related emails since the run started, updates `applications.db` (`applications`, `email_events`) and `ALL_APPLICATIONS.md`, and sends **one** iMessage: submitted (company – role), accounts created, needs you (captcha, missing answer, verification), top-tier openings, and notable emails (confirmations, OAs, rejections).
 
@@ -49,7 +49,7 @@ v1 already covers search, a tracker, auto-apply and mail reading. v2 changes *ho
 - **Auto-applying to a top-tier company.**
 - **Invented facts** in forms, cover letters or answers.
 - **Cover letters that read as AI-written.**
-- **Submitting with test data** (jobagent's `data/test-profile*.yaml`, test account `me@yyt.email`).
+- **Submitting with test data** (jobagent's `data/test-profile*.yaml`, test account `<test account email>`).
 - **Leaking sensitive data**: `SENSITIVE_IDS.md` stays off-limits to agents, as in v1's guard.
 
 ## 5. Decisions so far
@@ -63,7 +63,7 @@ v1 already covers search, a tracker, auto-apply and mail reading. v2 changes *ho
 | Search sources | Reddit, Xiaohongshu, LinkedIn, and similar | user |
 | Summary channel | iMessage via Argus's existing channel | user |
 | jobagent invocation | Subprocess `bin/jobagent`, one posting at a time, JSON result read back | my call |
-| jobagent profile | Generate `job_finding_agent/config/profile.yaml` from `APPLY_BRIEF.md` + `PROFILE.md`; résumé = `~/Desktop/yantian_yin_cv.pdf` (brief's "only file guaranteed uploadable") | my call |
+| jobagent profile | Generate `job_finding_agent/config/profile.yaml` from `APPLY_BRIEF.md` + `PROFILE.md`; résumé = `<résumé path>` (brief's "only file guaranteed uploadable") | my call |
 | Keep v1 limits | fit ≥ 4, ≤ 8/day, 08:30–22:00, one at a time | my call |
 | `seen_companies.txt` | No longer a company-wide skip list (the wider role scope would find almost nothing). Duplicates are checked per job instead (see §4); the file stays as a record of companies covered | my call |
 | Tracker source of truth | **Changed 2026-10-29 (see §8):** `applications.db` becomes the source; `ALL_APPLICATIONS.md` is rendered from it | my call |
@@ -73,9 +73,9 @@ v1 already covers search, a tracker, auto-apply and mail reading. v2 changes *ho
 
 ## 6. User answers (2026-10-25)
 1. **Uncertain duplicate → skip.** If Argus cannot be sure a posting is a different job from a past application (fuzzy company + role match, no URL/req id to tell them apart), it does not apply; the posting is marked `skipped` (`possible duplicate of <row>`) and listed in the summary so the user can apply by hand.
-2. **Account password:** one fixed password chosen by the user. It is stored only locally — in jobagent's gitignored config (`config/profile.yaml` `account.password` or `config/.env`, chmod 600) — and injected by jobagent's `account_fill` so the model never sees it. It must never appear in this repo, specs, logs, prompts, memory files or iMessages. Account email: `yantian.yin@mail.mcgill.ca` (from the brief; *my call, user did not object*).
+2. **Account password:** one fixed password chosen by the user. It is stored only locally — in jobagent's gitignored config (`config/profile.yaml` `account.password` or `config/.env`, chmod 600) — and injected by jobagent's `account_fill` so the model never sees it. It must never appear in this repo, specs, logs, prompts, memory files or iMessages. Account email: `<account email>` (from the brief; *my call, user did not object*).
 3. **Captcha → text the user and wait.** jobagent runs attended-by-iMessage: when it hits a captcha (or other `wait_for_human_action`), Argus texts the user the company, site and what to do in Chrome, and jobagent waits (with a timeout, e.g. 30 min) for the user's reply ("done" / "skip"). On timeout the posting is marked `needs_user` and listed in the summary. This needs jobagent to run in a Chrome the user can see (likely `--cdp` into their own Chrome, or jobagent's visible persistent profile) and a bridge from jobagent's `ask_human` / `wait_for_human_action` to Argus's iMessage channel. Applications already run only inside the 08:30–22:00 window.
-4. **Verification mail:** Mail.app has an Exchange account Argus already reads (3,346 triaged messages, McGill addresses in the index) — *assumed to be the McGill inbox; builder verifies*. jobagent reads verification codes through a bridge to Argus's Mail.app reader (jobagent's local-directory mailbox), so no IMAP credentials are needed.
+4. **Verification mail:** Mail.app has an Exchange account Argus already reads (the user's mail, with the account email's address in the index) — *assumed to be the account email's inbox; builder verifies*. jobagent reads verification codes through a bridge to Argus's Mail.app reader (jobagent's local-directory mailbox), so no IMAP credentials are needed.
 
 ## 7. Left to the builder
 - How to bridge jobagent's mailbox to Argus's mail reader (jobagent already supports a local-directory mailbox).
@@ -92,6 +92,6 @@ v1 already covers search, a tracker, auto-apply and mail reading. v2 changes *ho
 - **Human bridge:** jobagent writes `q-<n>.json`; Argus texts the user through an internal task; the user's reply reaches jobagent through a new chat tool `job_answer(question_id, answer)` (user turns only), which writes `a-<n>.json`. Timeout 30 min, then jobagent stops with `needs_input`/`blocked` → `needs_user`.
 - **Mail bridge:** while jobagent runs, Argus copies every new inbox message (all Mail.app accounts) as raw `.eml` into the run's `JOBAGENT_MAIL_DIR`; jobagent's existing `DirMailbox` reads them.
 - **Chrome:** jobagent's own visible persistent profile under its live data dir (not `--cdp`, not the user's Chrome).
-- **Test/live separation:** live runs use `JOBAGENT_DATA_DIR=<jobagent>/data/live` (own vault, log, Chrome profile). Argus refuses to start jobagent when the profile path contains `test-profile` or the account email is `me@yyt.email`.
+- **Test/live separation:** live runs use `JOBAGENT_DATA_DIR=<jobagent>/data/live` (own vault, log, Chrome profile). Argus refuses to start jobagent when the profile path contains `test-profile` or the account email is `<test account email>`.
 - **Cover letters:** two new jobagent tools, `cover_letter_library` (list reusable letters) and `cover_letter` (reuse one, or write one from the facts files under fixed style rules with a code-enforced banned-phrase check; saved as `.md` + `.docx` under `applications/<company>/`).
 - **Requested applications** ("申请 #id") still get an immediate result message; automatic ones only appear in the run summary.
