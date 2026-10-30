@@ -317,3 +317,30 @@ def test_read_body_decoder_crash_becomes_reader_error(fm, boxes, monkeypatch):
     monkeypatch.setattr(rd, "_body_text", boom)
     with pytest.raises(MailReaderError):
         reader(fm).read_body(mid)
+
+
+# --- read_raw ---
+
+
+def test_read_raw_returns_message_bytes(fm, boxes):
+    r = reader(fm)
+    a = add(fm, boxes["inbox"], subject="Verify", body="code 123456")
+    raw = r.read_raw(a)
+    assert raw.startswith(b"From: ")
+    assert b"Subject: Verify" in raw and b"code 123456" in raw
+    assert b"<plist" not in raw  # trailing plist excluded
+
+
+def test_read_raw_partial_emlx_is_returned(fm, boxes):
+    r = reader(fm)
+    a = add(fm, boxes["inbox"], body="partial body", partial=True)
+    assert b"partial body" in r.read_raw(a)
+
+
+def test_read_raw_missing(fm, boxes):
+    r = reader(fm)
+    with pytest.raises(MailNotFound):
+        r.read_raw(999)
+    nofile = add(fm, boxes["inbox"], write_file=False)
+    with pytest.raises(MailNotFound):
+        r.read_raw(nofile)

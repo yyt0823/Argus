@@ -384,15 +384,31 @@ class MailReader:
         return path
 
     @staticmethod
-    def _parse_emlx(path: Path) -> Message:
+    def _emlx_bytes(path: Path) -> bytes:
+        """RFC 822 bytes of an .emlx file: the byte-count line's worth of data, no trailing plist."""
         data = path.read_bytes()
         first, _, rest = data.partition(b"\n")
         try:
             n = int(first.strip())
-            raw = rest[:n]
         except ValueError:
-            raw = data  # not length-prefixed; treat the whole file as RFC 822
-        return email.message_from_bytes(raw, policy=email.policy.default)
+            return data  # not length-prefixed; treat the whole file as RFC 822
+        return rest[:n]
+
+    @staticmethod
+    def _parse_emlx(path: Path) -> Message:
+        return email.message_from_bytes(MailReader._emlx_bytes(path), policy=email.policy.default)
+
+    def read_raw(self, id: int) -> bytes:
+        """Raw RFC 822 bytes of one message (a .partial.emlx has headers and text body too)."""
+        if not self._query("SELECT 1 FROM messages WHERE ROWID = ?", (id,)):
+            raise MailNotFound(f"no message {id}")
+        path = self._find_file(id)
+        if path is None:
+            raise MailNotFound(f"no file for message {id}")
+        try:
+            return self._emlx_bytes(path)
+        except OSError as e:
+            raise MailNotFound(f"cannot read file for message {id}: {e}") from e
 
     def read_body(self, id: int, max_chars: int = 20000) -> str:
         """Headers + plain-text body of one message, at most ``max_chars`` characters."""
