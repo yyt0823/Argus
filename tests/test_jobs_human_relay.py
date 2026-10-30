@@ -87,3 +87,42 @@ async def test_answer_after_expired_marker_is_rejected(tmp_path):
     (tmp_path / "q-1.expired").write_text("")
     assert relay.answer("7-1", "late") == "expired"
     assert relay.pending() == []
+
+
+async def test_rerun_of_posting_replaces_registration(tmp_path):
+    a, b = tmp_path / "a", tmp_path / "b"
+    a.mkdir(); b.mkdir()
+    relay, texts = make()
+    write_q(a, 1)
+    await run_watch(relay, a)
+    write_q(b, 1, at=NOW + timedelta(minutes=5))
+    await run_watch(relay, b)
+    assert len(texts) == 2
+    assert relay.answer("7-1", "yes") == "sent"
+    assert (b / "a-1.json").exists() and not (a / "a-1.json").exists()
+
+
+async def test_action_accepts_only_done_or_skip(tmp_path):
+    relay, _ = make()
+    write_q(tmp_path, 1, kind="action")
+    await run_watch(relay, tmp_path)
+    assert relay.answer("7-1", "maybe later") == "invalid"
+    assert not (tmp_path / "a-1.json").exists()
+    assert relay.answer("7-1", " 好了 ") == "sent"
+
+
+async def test_second_answer_refused(tmp_path):
+    relay, _ = make()
+    write_q(tmp_path, 1)
+    await run_watch(relay, tmp_path)
+    assert relay.answer("7-1", "a") == "sent"
+    assert relay.answer("7-1", "b") == "already_answered"
+    assert json.loads((tmp_path / "a-1.json").read_text()) == {"answer": "a"}
+
+
+async def test_company_and_role_are_untrusted(tmp_path):
+    relay, texts = make()
+    write_q(tmp_path, 1)
+    await run_watch(relay, tmp_path)
+    head, _, block = texts[0].partition("<untrusted_web>")
+    assert "Acme" not in head and "Acme — SWE Intern" in block

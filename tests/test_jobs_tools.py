@@ -2,8 +2,8 @@ from datetime import datetime, timedelta
 
 import pytest
 
-from argus.jobs.human_relay import HumanRelay
 from argus.config import Config, JobsConfig
+from argus.jobs.human_relay import HumanRelay
 from argus.store import Store
 from argus.tools.jobs import build_jobs_tools
 
@@ -251,6 +251,8 @@ async def test_job_answer_refused_in_system_turn(env):
 @pytest.mark.parametrize("result,expected", [
     ("expired", "That question expired; the application was marked needs_user."),
     ("unknown", "No such pending question."),
+    ("invalid", "For this request answer exactly 'done' or 'skip'."),
+    ("already_answered", "That question was already answered."),
 ])
 async def test_job_answer_replies(env, result, expected):
     _, _, sched, t = env

@@ -252,6 +252,10 @@ def build_jobs_tools(
             return _ok("Passed to jobagent.")
         if result == "expired":
             return _ok("That question expired; the application was marked needs_user.")
+        if result == "invalid":
+            return _ok("For this request answer exactly 'done' or 'skip'.")
+        if result == "already_answered":
+            return _ok("That question was already answered.")
         return _ok("No such pending question.")
 
     return [jobs_scout_now, jobs_list, job_apply, job_skip, jobs_followups, job_answer]
