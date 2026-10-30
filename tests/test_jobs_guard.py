@@ -54,7 +54,8 @@ def ok(policy, tool, inp):
 
 @pytest.mark.parametrize("path", [
     "{about}/PROFILE.md", "{about}/EDUCATION.md", "{intern}/README.md", "README.md", "../PROFILE.md",
-    "seen_companies.txt", "{about}/cv.pdf", "{intern}/raw/../INTERNSHIPS.md", "{about}/new_file.md",
+    "seen_companies.txt", "ALL_APPLICATIONS.md", "CN_TRACKER.md", "{intern}/ALL_APPLICATIONS.md",
+    "{intern}/CN_TRACKER.md", "{about}/cv.pdf", "{intern}/raw/../INTERNSHIPS.md", "{about}/new_file.md",
 ])
 def test_scout_read_allowed(tree, path):
     about, intern = tree
@@ -149,7 +150,7 @@ def test_scout_write_allowed(tree, tool, path):
     "../PROFILE.md", "{about}/new.md", "{about}/SENSITIVE_IDS.md", "sneaky.md", "../SENSITIVE_IDS.md",
     "{intern}/../outside.md", "{intern}/docs_link/x.md", "/tmp/x.md", "{intern}/SENSITIVE_IDS.md",
     "APPLY_BRIEF.md", "README.md", "FOLLOW_UPS.md", "{intern}/applications/acme.md", "{intern}/new_dir/x.md",
-    "raw", "{intern}", "new.md", "raw/../README.md",
+    "ALL_APPLICATIONS.md", "CN_TRACKER.md", "applications.db", "raw", "{intern}", "new.md", "raw/../README.md",
 ])
 def test_scout_write_denied(tree, tool, path):
     about, intern = tree

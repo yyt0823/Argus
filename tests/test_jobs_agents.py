@@ -10,7 +10,7 @@ from claude_agent_sdk import ClaudeAgentOptions
 from argus.config import Config, JobsConfig
 from argus.jobs.agent import AgentOutcome, last_json_array, last_json_object
 from argus.jobs.guard import GuardPolicy
-from argus.jobs.scout import SCOUT_PROMPT, ScoutResult, build_scout_options, build_scout_prompt, parse_postings, run_scout
+from argus.jobs.scout import SCOUT_PROMPT, SCOUT_SYSTEM_PROMPT, ScoutResult, build_scout_options, build_scout_prompt, parse_postings, run_scout
 
 
 @pytest.fixture
@@ -108,6 +108,27 @@ def test_parse_postings_validates():
     assert [p["verified"] for p in out] == [True, True, False, None, None]
     assert out[0]["company"] == "Acme" and out[0]["city"] is None
     assert set(out[0]) == {"company", "role", "city", "term", "deadline", "fit", "notes", "url", "verified", "ats"}
+
+
+def test_scout_prompt_scope():
+    for word in ("Reddit", "Xiaohongshu", "LinkedIn", "remote", "product manager", "ALL_APPLICATIONS.md",
+                 "APPLY_BRIEF.md", "../PROFILE.md", "workable from Canada", "add 1 to fit, max 5"):
+        assert word in SCOUT_PROMPT
+    assert "Do NOT re-list any company already in seen_companies.txt" not in SCOUT_PROMPT
+    for name in ("ALL_APPLICATIONS.md", "CN_TRACKER.md", "applications.db"):
+        assert name in SCOUT_SYSTEM_PROMPT
+
+
+def test_parse_postings_folds_source_into_notes():
+    out = parse_postings([
+        {"url": "https://a.example/1", "notes": "Py", "source": "reddit", "level": "intern"},
+        {"url": "https://a.example/2", "source": "linkedin"},
+        {"url": "https://a.example/3", "notes": "plain"},
+    ])
+    assert out[0]["notes"] == "[source: reddit; level: intern] Py"
+    assert out[1]["notes"] == "[source: linkedin] "
+    assert out[2]["notes"] == "plain"
+    assert "source" not in out[0] and "level" not in out[0]
 
 
 async def test_run_scout_success(cfg):
