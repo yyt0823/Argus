@@ -63,8 +63,8 @@ self_handles = ["+15550000000"]
 # sodium_mg_max = 2300
 
 # --- Internships (optional) ---
-# Daily internship search and automatic applications in your Chrome via the Claude in Chrome
-# extension (see "Internships" in the README). All keys optional; defaults shown.
+# Daily internship search and automatic applications through jobagent (see "Internships" in the
+# README). All keys optional; defaults shown.
 # [jobs]
 # enabled = true                     # false: no searches, applications, tools or briefing section
 # scout_time = "07:30"               # daily search (run on start if missed today)
@@ -74,7 +74,7 @@ self_handles = ["+15550000000"]
 # apply_window = ["08:30", "22:00"]  # only apply between these times
 # internships_dir = "data/about_me/internships"
 # resume_path = "data/about_me/yantian_yin_cv.pdf"
-# cli_path = "/opt/homebrew/bin/claude"   # installed Claude Code CLI used for Chrome
+# cli_path = "/opt/homebrew/bin/claude"   # unused since applications moved to jobagent
 # jobagent_dir = "~/Desktop/side_project/job_finding_agent"   # the jobagent checkout that applies
 # jobagent_profile = "config/profile.yaml"   # relative to jobagent_dir
 # jobagent_model = "..."             # unset: jobagent's default model

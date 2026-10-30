@@ -1,4 +1,4 @@
-"""Scout and applier: option builders, JSON result parsing, runner failures (no live calls)."""
+"""Scout: option builders, JSON result parsing, runner failures (no live calls)."""
 
 import json
 from datetime import date
@@ -8,9 +8,7 @@ import pytest
 from claude_agent_sdk import ClaudeAgentOptions
 
 from argus.config import Config, JobsConfig
-from argus.jobs import applier as applier_mod
 from argus.jobs.agent import AgentOutcome, last_json_array, last_json_object
-from argus.jobs.applier import APPLY_RESULTS, ApplyResult, apply_to, build_apply_options, build_apply_system_prompt
 from argus.jobs.guard import GuardPolicy
 from argus.jobs.scout import SCOUT_PROMPT, ScoutResult, build_scout_options, build_scout_prompt, parse_postings, run_scout
 
@@ -154,113 +152,6 @@ async def test_run_scout_result_error_with_json_still_ok(cfg):
     assert res.ok is True and len(res.postings) == 1
 
 
-# --- applier ---
-
-POSTING = {"id": 7, "company": "Example", "role": "Test", "url": "https://example.com", "fit": 4}
-
-
-def test_build_apply_options(cfg):
-    o = build_apply_options(cfg)
-    assert o.extra_args == {"chrome": None}
-    assert o.cli_path == "/usr/local/bin/claude-test"
-    assert o.setting_sources == []
-    assert o.tools == ["Read", "Write", "Edit", "ToolSearch"]
-    assert o.allowed_tools == []
-    assert o.permission_mode == "default"
-    assert Path(o.cwd) == cfg.jobs_internships_dir
-    assert isinstance(o.can_use_tool, GuardPolicy) and o.can_use_tool.mode == "apply"
-    assert o.hooks["PreToolUse"][0].hooks == [o.can_use_tool.pre_tool_use_hook]
-    assert o.max_turns == 120
-    sp = o.system_prompt
-    assert sp.startswith("# Apply brief\nHARD RULE: never create accounts.")
-    assert str(cfg.jobs_resume_path) in sp
-    for needle in ("tabs_context_mcp", "chrome_not_connected", "select_browser", "switch_browser",
-                   "needs_login", "needs_attestation", "```json", "guessed_answers"):
-        assert needle in sp, needle
-
-
-def test_apply_system_prompt_reads_brief_at_call_time(cfg):
-    brief = cfg.jobs_internships_dir / "APPLY_BRIEF.md"
-    brief.write_text("version two")
-    assert build_apply_system_prompt(cfg).startswith("version two")
-
-
-def test_apply_smoke_addendum(cfg, monkeypatch):
-    assert "SMOKE TEST" not in build_apply_system_prompt(cfg)
-    monkeypatch.setenv("ARGUS_JOBS_SMOKE", "1")
-    assert "SMOKE TEST" in build_apply_system_prompt(cfg)
-
-
-async def test_apply_to_submitted(cfg):
-    text = ('Done.\n```json\n{"company": "Example", "role": "Test", "req_id": "R1", "result": "submitted", '
-            '"detail": "Submitted via Workday", "follow_up": "check email", "guessed_answers": ["How heard: LinkedIn"]}\n```')
-    r = FakeRunner(text, cost=0.8)
-    res = await apply_to(cfg, POSTING, runner=r)
-    assert res == ApplyResult(result="submitted", detail="Submitted via Workday", follow_up="check email",
-                              guessed_answers=["How heard: LinkedIn"], cost_usd=0.8, raw=text)
-    prompt, options = r.calls[0]
-    assert "https://example.com" in prompt and "Example" in prompt
-    assert options.extra_args == {"chrome": None}
-
-
-@pytest.mark.parametrize("result", APPLY_RESULTS)
-async def test_apply_to_each_result(cfg, result):
-    text = json.dumps({"result": result, "detail": "d"})
-    res = await apply_to(cfg, POSTING, runner=FakeRunner(text))
-    assert res.result == result and res.follow_up is None and res.guessed_answers == []
-
-
-@pytest.mark.parametrize("text", [
-    "no json", '{"result": "applied"}', '{"detail": "x"}', "", '["submitted"]',
-])
-async def test_apply_to_unparseable(cfg, text):
-    res = await apply_to(cfg, POSTING, runner=FakeRunner(text))
-    assert res.result == "error" and res.detail and res.raw == text
-
-
-async def test_apply_to_normalises_fields(cfg):
-    text = '{"result": "needs_login", "detail": null, "follow_up": "", "guessed_answers": "one"}'
-    res = await apply_to(cfg, POSTING, runner=FakeRunner(text))
-    assert res.result == "needs_login" and res.detail == "" and res.follow_up is None
-    assert res.guessed_answers == ["one"]
-
-
-async def test_apply_to_runner_exception(cfg):
-    res = await apply_to(cfg, POSTING, runner=FakeRunner(exc=RuntimeError("boom")))
-    assert res.result == "error" and "boom" in res.detail and res.cost_usd is None
-
-
-async def test_apply_to_error_result_without_json(cfg):
-    res = await apply_to(cfg, POSTING, runner=FakeRunner("x", is_error=True, error="error_max_turns", cost=3.0))
-    assert res.result == "error" and "error_max_turns" in res.detail and res.cost_usd == 3.0
-
-
-async def test_apply_to_missing_brief(cfg):
-    (cfg.jobs_internships_dir / "APPLY_BRIEF.md").unlink()
-    r = FakeRunner('{"result": "submitted"}')
-    res = await apply_to(cfg, POSTING, runner=r)
-    assert res.result == "error" and "APPLY_BRIEF.md" in res.detail and r.calls == []
-
-
-async def test_apply_to_missing_resume(cfg):
-    cfg.jobs_resume_path.unlink()
-    r = FakeRunner('{"result": "submitted"}')
-    res = await apply_to(cfg, POSTING, runner=r)
-    assert res.result == "error" and "résumé" in res.detail and r.calls == []
-
-
-async def test_apply_to_posting_without_url(cfg):
-    r = FakeRunner('{"result": "submitted"}')
-    res = await apply_to(cfg, {"company": "X"}, runner=r)
-    assert res.result == "error" and r.calls == []
-
-
-def test_apply_module_has_no_default_bundled_cli(cfg):
-    # The bundled CLI would repoint the user's Chrome native host; always pass the installed one.
-    assert build_apply_options(cfg).cli_path == cfg.jobs.cli_path
-    assert applier_mod.APPLY_MAX_TURNS == 120
-
-
 # --- review fixes: budgets, policy wiring, prompts ---
 
 def test_scout_budget_and_write_rules(cfg):
@@ -269,51 +160,10 @@ def test_scout_budget_and_write_rules(cfg):
     assert "APPLY_BRIEF.md" in o.system_prompt and "raw/" in o.system_prompt
 
 
-def test_apply_budget_and_posting_url(cfg):
-    o = build_apply_options(cfg, "https://careers.acme.com/1")
-    assert o.max_budget_usd == 2.0
-    assert o.can_use_tool.posting_url == "https://careers.acme.com/1"
+def test_scout_budget_from_config(cfg):
     cfg2 = Config(root=cfg.root, self_handles=cfg.self_handles,
-                  jobs=JobsConfig(resume_path="data/about_me/cv.pdf", apply_budget_usd=0.5, scout_budget_usd=1.0))
-    assert build_apply_options(cfg2).max_budget_usd == 0.5
+                  jobs=JobsConfig(resume_path="data/about_me/cv.pdf", scout_budget_usd=1.0))
     assert build_scout_options(cfg2).max_budget_usd == 1.0
-
-
-async def test_apply_to_passes_posting_url_to_policy(cfg):
-    r = FakeRunner('{"result": "skipped", "detail": "x"}')
-    await apply_to(cfg, POSTING, runner=r)
-    _, options = r.calls[0]
-    assert options.can_use_tool.posting_url == "https://example.com"
-    assert options.can_use_tool.decide("mcp__claude-in-chrome__navigate", {"url": "https://example.com/a", "tabId": 1})[0]
-
-
-def test_apply_addendum_rules(cfg):
-    sp = build_apply_system_prompt(cfg)
-    for needle in ("needs_user", "do NOT guess", "tabs_close_mcp", "include the tab's current URL",
-                   "myworkdayjobs.com", "javascript_tool", "OPEN_QUESTIONS.md"):
-        assert needle in sp, needle
-
-
-def test_apply_addendum_lists_transcripts(cfg):
-    about = cfg.jobs_about_me_dir
-    (about / "official_transcript.pdf").write_bytes(b"%PDF")
-    (about / "notes.pdf").write_bytes(b"%PDF")
-    sp = build_apply_system_prompt(cfg)
-    assert str(about / "official_transcript.pdf") in sp and "notes.pdf" not in sp
-
-
-def test_apply_prompt_prior_attempt_note():
-    from argus.jobs.applier import PRIOR_ATTEMPT, build_apply_prompt
-    plain = build_apply_prompt({**POSTING, "status_detail": "requested"})
-    assert "may already have submitted" not in plain
-    again = build_apply_prompt({**POSTING, "status_detail": f"requested; {PRIOR_ATTEMPT}"})
-    assert "A previous attempt may already have submitted this application" in again
-    assert "already submitted" in again and "without re-submitting" in again
-
-
-async def test_apply_to_needs_user(cfg):
-    res = await apply_to(cfg, POSTING, runner=FakeRunner('{"result": "needs_user", "detail": "Q: GPA?"}'))
-    assert res.result == "needs_user" and res.detail == "Q: GPA?"
 
 
 def test_untrusted_block_defangs():

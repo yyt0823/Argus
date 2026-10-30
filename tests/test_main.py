@@ -412,6 +412,33 @@ def test_build_app_wires_job_scheduler(tmp_path, fake_chat_db, monkeypatch):
         app.store.close()
 
 
+def test_build_app_wires_tracker_and_mail_reader(tmp_path, fake_chat_db, monkeypatch):
+    _record_session_factory(monkeypatch)
+    fm = build_fake_mail(tmp_path)
+    cfg = Config(root=tmp_path, self_handles=("+15550000000",), chat_db=fake_chat_db.path)
+    cfg.jobs_internships_dir.mkdir(parents=True)
+    app = build_app(cfg, mail_reader_factory=lambda: MailReader(fm.mail_dir, fm.accounts_db))
+    try:
+        sched = app.job_scheduler
+        assert sched._tracker is not None and sched._tracker.db_path.is_file()  # migrated at startup
+        assert sched._tracker.rows() == []
+        assert isinstance(sched._apply_fn.keywords["reader"], MailReader)
+        assert sched._apply_fn.keywords["relay"] is sched.relay
+    finally:
+        app.store.close()
+
+
+def test_build_app_continues_without_tracker(tmp_path, fake_chat_db, monkeypatch, caplog):
+    _record_session_factory(monkeypatch)
+    cfg = Config(root=tmp_path, self_handles=("+15550000000",), chat_db=fake_chat_db.path)
+    app = build_app(cfg)  # the internships directory does not exist: migrate fails
+    try:
+        assert app.job_scheduler is not None and app.job_scheduler._tracker is None
+        assert "applications tracker" in caplog.text
+    finally:
+        app.store.close()
+
+
 def test_build_app_without_jobs_when_disabled(tmp_path, fake_chat_db, monkeypatch):
     from argus.config import JobsConfig
     calls = _record_session_factory(monkeypatch)

@@ -152,7 +152,7 @@ def build_jobs_tools(
         "job_apply",
         "Apply to one posting by its #id (from jobs_list): queues it ahead of automatic applications. "
         "Only when the user asks for it in their own message. "
-        "Argus applies in the user's Chrome in the background, one application at a time, only during "
+        "Argus applies with jobagent in the background, one application at a time, only during "
         f"the apply window ({window}); the outcome is reported later. Queuing is NOT applying: never "
         "say an application was submitted until jobs_list shows status submitted or Argus reports it.",
         {

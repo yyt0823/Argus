@@ -24,6 +24,7 @@ from argus.channel.imessage import IMessageChannel
 from argus.config import Config, load_config
 from argus.fitness.importer import import_markdown_logs
 from argus.jobs.scheduler import JobScheduler
+from argus.jobs.tracker import ApplicationsTracker
 from argus.mail.reader import MailReader
 from argus.briefing import BriefingScheduler
 from argus.mail.watcher import MailWatcher
@@ -87,15 +88,26 @@ def import_fitness_logs(cfg: Config, store: Store) -> None:
     log.info("fitness log import: %s", result)
 
 
-def make_job_scheduler(cfg: Config, store: Store) -> JobScheduler | None:
+def open_tracker(cfg: Config) -> ApplicationsTracker | None:
+    """The applications tracker, migrated once; None (logged) if it cannot be opened."""
+    tracker = ApplicationsTracker(cfg.jobs_internships_dir)
+    try:
+        tracker.migrate()
+    except Exception:
+        log.exception("jobs: cannot open the applications tracker %s; continuing without it", tracker.db_path)
+        return None
+    return tracker
+
+
+def make_job_scheduler(cfg: Config, store: Store, reader: MailReader | None = None) -> JobScheduler | None:
     """The internship scheduler, or None when ``[jobs]`` is disabled. ``submit`` is set by
-    ``build_app`` once the App exists."""
+    ``build_app`` once the App exists. ``reader`` (or None) feeds jobagent's mail bridge."""
     if not cfg.jobs.enabled:
         return None
     if not cfg.jobs_internships_dir.is_dir():
         log.warning("jobs: internships directory %s not found; searches will fail until it exists",
                     cfg.jobs_internships_dir)
-    return JobScheduler(cfg, store, submit=None)
+    return JobScheduler(cfg, store, submit=None, tracker=open_tracker(cfg), reader=reader)
 
 
 def build_app(cfg: Config, mail_reader_factory: Callable[[], MailReader] | None = None) -> App:
@@ -112,7 +124,7 @@ def build_app(cfg: Config, mail_reader_factory: Callable[[], MailReader] | None 
         memory = MemoryStore(cfg.memory_dir)
         channel = IMessageChannel(cfg.chat_db, cfg.self_handles, store, mode=cfg.mode)
         reader = open_mail_reader(cfg, mail_reader_factory)
-        scheduler = make_job_scheduler(cfg, store)
+        scheduler = make_job_scheduler(cfg, store, reader)
         # Backups are driven by backup_loop(), not by Brain's rollover hook, because the hook
         # only fires when a message arrives after the rollover hour.
         brain = Brain(

@@ -11,13 +11,31 @@
    the last 7 days whose URL is on a known ATS (``guard.auto_apply_eligible``); others are
    only reported;
 4. inside ``jobs.apply_window`` and while no application runs: takes one ``queued`` posting
-   (explicitly requested ones first, then oldest) and applies to it in the background.
+   (explicitly requested ones first, then oldest) and applies to it in the background with
+   jobagent (``jobagent_applier.apply_with_jobagent``).
 
-Limits: a scout run times out after 45 min, an application after 30 min (result ``error``,
-"timed out"). Automatic applications stop for the day once ``daily_apply_limit`` automatic
-submissions or ``2 * daily_apply_limit`` application runs (any outcome) happened; explicitly
-requested ones are exempt. ``chrome_not_connected`` is retried after 30 min, at most
-``CHROME_RETRIES_PER_DAY`` times a day, then not until the next day (one alert per day).
+Notify-only companies (``jobs.notify_only_companies``, compared with ``dedup.norm_company``): a
+scouted ``new`` posting of such a company becomes ``notify_only`` and the user gets one alert
+right away. It is never queued automatically (upsert keeps the status, so the alert is sent once).
+
+Before a posting becomes ``applying``, ``dedup.check_duplicate`` compares it with the
+applications tracker, earlier Argus submissions and jobagent's own log. A ``duplicate`` is
+``skipped`` ("duplicate of ...") and never applied; a ``possible`` duplicate is ``skipped``
+("possible duplicate of ...") unless the user requested it explicitly, in which case it is applied
+and the note is added to the result detail. Skips are not runs. If the tracker or jobagent's log
+cannot be read, no automatic application starts that tick (requested ones are still checked
+against what could be read). Then ``jobagent_applier.preflight``: if jobagent cannot be used, the
+posting stays ``queued``, applications pause until the next day and the user gets one alert per day.
+
+Limits: a scout run times out after 45 min, an application after ``apply_timeout`` (result
+``error``, "timed out"). Automatic applications stop for the day once ``daily_apply_limit``
+automatic submissions or ``2 * daily_apply_limit`` application runs (any outcome) happened;
+explicitly requested ones are exempt.
+
+Alerts: only explicitly requested applications get an alert per outcome (``APPLY_ALERT_TEXT``).
+Automatic ones send nothing; the end-of-run summary reports them. A ``submitted`` application is
+also added to the applications tracker (``ApplicationsTracker.add_application`` +
+``render_markdown``); tracker errors are logged, never raised.
 
 An application ``error`` is never retried automatically (a failed run may still have
 submitted). The user can re-request it with ``job_apply``; the applier is then told to check
@@ -33,9 +51,8 @@ derived fields in them are wrapped in ``<untrusted_web>`` blocks.
 State keys (``Store.get_state``/``set_state``):
 
 - ``jobs_last_scout``: ISO date of the last daily scout start.
-- ``jobs_chrome_notified``: ISO date the user was last told Chrome is not connected.
-- ``jobs_day_counts``: JSON ``{"day", "runs", "auto_runs", "auto_submitted", "chrome_failures"}``
-  for the current day.
+- ``jobs_preflight_notified``: ISO date the user was last told jobagent cannot be used.
+- ``jobs_day_counts``: JSON ``{"day", "runs", "auto_runs", "auto_submitted"}`` for the current day.
 - ``jobs_interrupted``: comma-separated posting ids interrupted by a shutdown, alerted on the
   next start.
 """
@@ -43,17 +60,25 @@ State keys (``Store.get_state``/``set_state``):
 from __future__ import annotations
 
 import asyncio
+import functools
 import json
 import logging
+import re
 from collections.abc import Awaitable, Callable
+from dataclasses import replace
 from datetime import date, datetime, timedelta
+from pathlib import Path
 
 from argus.config import Config
 from argus.jobs.agent import untrusted_block
-from argus.jobs.applier import PRIOR_ATTEMPT, ApplyResult, apply_to
+from argus.jobs.applier import PRIOR_ATTEMPT, ApplyResult
+from argus.jobs.dedup import check_duplicate, norm_company, req_id
 from argus.jobs.guard import auto_apply_eligible
 from argus.jobs.human_relay import HumanRelay
+from argus.jobs.jobagent_applier import apply_with_jobagent, preflight
 from argus.jobs.scout import ScoutResult, run_scout
+from argus.jobs.tracker import ApplicationsTracker
+from argus.mail.reader import MailReader
 from argus.mail.watcher import INTERNAL_PREFIX
 from argus.store import JOB_STATUSES
 
@@ -61,8 +86,6 @@ log = logging.getLogger(__name__)
 
 TICK_SECONDS = 60
 QUEUE_MAX_AGE = timedelta(days=7)
-CHROME_PAUSE = timedelta(minutes=30)  # wait before retrying after "chrome_not_connected"
-CHROME_RETRIES_PER_DAY = 3  # then wait until the next day
 SCOUT_TIMEOUT = 45 * 60.0  # seconds
 QUEUE_SCAN_LIMIT = 1000
 
@@ -73,13 +96,22 @@ def apply_timeout(cfg: Config) -> float:
 
 
 KEY_LAST_SCOUT = "jobs_last_scout"
-KEY_CHROME_NOTIFIED = "jobs_chrome_notified"
+KEY_PREFLIGHT_NOTIFIED = "jobs_preflight_notified"
 KEY_DAY_COUNTS = "jobs_day_counts"
 KEY_INTERRUPTED = "jobs_interrupted"
 
 REQUESTED = "requested"
 INTERRUPTED_DETAIL = "interrupted during application — check manually"
 TIMED_OUT_DETAIL = "timed out"
+JOBAGENT_LOG_NAME = "applications.jsonl"  # jobagent's own log, in jobagent_live_dir
+# Tracker region heuristic: "China" when the company name has CJK characters or the city names a
+# Chinese city (or China itself); everything else is "Canada" (which also covers remote roles).
+_CJK = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]")
+_CHINA_CITY = re.compile(
+    r"\b(china|beijing|shanghai|shenzhen|guangzhou|hangzhou|chengdu|nanjing|wuhan|suzhou|xi'?an|"
+    r"tianjin|chongqing|hefei|xiamen)\b|中国|北京|上海|深圳|广州|杭州|成都|南京|武汉|苏州|西安|天津|重庆|合肥|厦门",
+    re.IGNORECASE,
+)
 # Statuses after which a re-request may find the application already submitted.
 PRIOR_ATTEMPT_STATUSES = ("error", "needs_attestation", "needs_user")
 # Until the Store knows "needs_user", such postings are stored as "error" with a detail prefix.
@@ -107,11 +139,15 @@ SCOUT_FAILED_TEXT = (
     f"{INTERNAL_PREFIX} The internship search the user asked for failed. Tell the user briefly in "
     "one short message and suggest trying again later. Error: {error}"
 )
-CHROME_TEXT = (
-    f"{INTERNAL_PREFIX} Argus wanted to apply to internships but Chrome is not connected. Tell the "
-    "user briefly in one short message: open Chrome and make sure the Claude extension is signed in "
-    "(same Claude account as Argus). Pending applications stay queued and are retried automatically "
-    "(at most a few times a day)."
+PREFLIGHT_TEXT = (
+    f"{INTERNAL_PREFIX} Argus wanted to apply to internships but jobagent (the program that "
+    "applies) cannot be used: {error}. Tell the user briefly in one short message. Pending "
+    "applications stay queued; Argus tries again tomorrow or after a restart."
+)
+NOTIFY_ONLY_TEXT = (
+    f"{INTERNAL_PREFIX} A top-tier company posted an opening; Argus never applies to these "
+    "companies. Send the user one short message of the form \"Top-tier opening (Argus never "
+    "applies here): <company> — <role>, <url>\" with the values below. " + _UNTRUSTED_NOTE + "\n"
 )
 INTERRUPTED_TEXT = (
     f"{INTERNAL_PREFIX} Argus was stopped while applying to the posting(s) below. They may or may "
@@ -119,28 +155,38 @@ INTERRUPTED_TEXT = (
     "to check (e.g. for a confirmation email) and, if not submitted, apply themselves or ask Argus "
     "to try again. Never say they were submitted. " + _UNTRUSTED_NOTE + "\n"
 )
+_NOT_SUBMITTED = " Never say it was submitted."
+# One alert per outcome of an application the user requested (automatic ones send none).
 APPLY_ALERT_TEXT = {
+    "submitted": (
+        "The application the user asked for was submitted by jobagent. Tell the user briefly, with "
+        "the company and role (and the detail if it matters)."
+    ),
     "needs_login": (
-        "The application needs the user to log in or create an account (Argus never does that). "
-        "Tell the user briefly, with the link, so they can apply themselves."
+        "jobagent could not log in or register on the application site. Tell the user briefly, "
+        "with the link, so they can apply themselves." + _NOT_SUBMITTED
     ),
     "needs_attestation": (
         "The application form is filled in, but an attestation / consent box must be ticked by the "
-        "user before submitting; the page is left open in Chrome. Tell the user briefly, with the link, "
-        "to tick it and submit."
+        "user before submitting. Tell the user briefly, with the link, to finish it." + _NOT_SUBMITTED
     ),
     "needs_user": (
-        "The application stopped before submitting because a required question needs an answer "
-        "Argus does not know (it never guesses); the page is left open in Chrome. Tell the user "
-        "briefly, with the link and the question, so they can finish it or tell Argus the answer."
+        "jobagent stopped before submitting because the application needs the user (a question it "
+        "has no answer for, a blocked step, or a final check). Tell the user briefly, with the link "
+        "and the detail, so they can finish it or ask Argus to try again." + _NOT_SUBMITTED
     ),
     "error": (
         "The application failed and was not retried (it may or may not have been submitted). Tell "
         "the user briefly, with the link, so they can check and apply themselves or ask Argus to "
-        "try again."
+        "try again." + _NOT_SUBMITTED
+    ),
+    "skipped": (
+        "Argus did not apply to the posting the user asked for (the reason is the detail, e.g. a "
+        "duplicate of an earlier application, or the posting is closed or already applied to). Tell "
+        "the user briefly, with the link." + _NOT_SUBMITTED
     ),
 }
-APPLY_ALERT_HEAD = f"{INTERNAL_PREFIX} {{what}} Never say it was submitted. " + _UNTRUSTED_NOTE + "\n"
+APPLY_ALERT_HEAD = f"{INTERNAL_PREFIX} {{what}} " + _UNTRUSTED_NOTE + "\n"
 
 Submit = Callable[[str], Awaitable[None]]
 ScoutFn = Callable[..., Awaitable[ScoutResult]]
@@ -173,6 +219,31 @@ def posting_line(p: dict) -> str:
     return " | ".join(parts)
 
 
+def tracker_region(city: str | None, company: str | None) -> str:
+    """``"China"`` for a CJK company name or a Chinese city, else ``"Canada"`` (simple heuristic)."""
+    if _CJK.search(company or "") or _CHINA_CITY.search(city or ""):
+        return "China"
+    return "Canada"
+
+
+def read_jobagent_log(path: Path) -> list[dict]:
+    """jobagent's applications log (JSON lines). A missing file is empty; bad lines are skipped.
+    Other read errors raise ``OSError``."""
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except FileNotFoundError:
+        return []
+    entries = []
+    for line in text.splitlines():
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(entry, dict):
+            entries.append(entry)
+    return entries
+
+
 class JobScheduler:
     def __init__(
         self,
@@ -180,15 +251,25 @@ class JobScheduler:
         store,
         submit: Submit | None,
         scout_fn: ScoutFn = run_scout,
-        apply_fn: ApplyFn = apply_to,
+        apply_fn: ApplyFn | None = None,
         now: Callable[[], datetime] = datetime.now,
+        tracker: ApplicationsTracker | None = None,
+        reader: MailReader | None = None,
+        preflight_fn: Callable[[Config], str | None] = preflight,
     ) -> None:
+        """``apply_fn`` defaults to jobagent with ``reader`` (the Mail reader, or None) and
+        ``self.relay``; ``tracker`` (or None) is used for the duplicate check and gets a row per
+        submission."""
         self._cfg = cfg
         self._store = store
         self.submit = submit  # public: main wires it to App.submit_internal after the App exists
         self.relay = HumanRelay(submit=None)  # public: main wires its submit; used by job_answer
         self._scout_fn = scout_fn
+        if apply_fn is None:
+            apply_fn = functools.partial(apply_with_jobagent, reader=reader, relay=self.relay)
         self._apply_fn = apply_fn
+        self._tracker = tracker
+        self._preflight_fn = preflight_fn
         self._now = now
         self._scout_task: asyncio.Task | None = None
         self._apply_task: asyncio.Task | None = None
@@ -236,7 +317,7 @@ class JobScheduler:
         self._maybe_daily_scout(now)
         if self._cfg.jobs.auto_apply:
             self._queue_auto(now)
-        self._maybe_apply(now)
+        await self._maybe_apply(now)
 
     # --- requests (chat tools) ---
 
@@ -288,7 +369,7 @@ class JobScheduler:
         stored: list[dict] = []
         try:
             if result.ok:
-                stored = self._store_postings(result.postings)
+                stored = await self._store_postings(result.postings)
             summary = result.summary if result.ok else f"{result.error or 'failed'}; {result.summary}".rstrip("; ")
             self._store.finish_job_run(run_id, self._now(), result.ok, summary, result.cost_usd)
             log.info("scout finished: ok=%s, %d posting(s), cost=%s", result.ok, len(stored), result.cost_usd)
@@ -300,8 +381,11 @@ class JobScheduler:
                 self._report_scout = False
                 await self._send(self._scout_report(result, stored))
 
-    def _store_postings(self, postings: list[dict]) -> list[dict]:
-        stored = []
+    async def _store_postings(self, postings: list[dict]) -> list[dict]:
+        """Upsert the scout's postings; a ``new`` posting of a notify-only company becomes
+        ``notify_only`` and is alerted once."""
+        top_tier = {norm_company(c) for c in self._cfg.jobs.notify_only_companies} - {""}
+        stored, alerts = [], []
         for p in postings:
             try:
                 # No "status": new rows start as "new"; existing rows keep theirs.
@@ -309,8 +393,26 @@ class JobScheduler:
             except (ValueError, TypeError) as e:
                 log.warning("skipping invalid posting %r: %s", p.get("url"), e)
                 continue
-            stored.append({**p, "id": pid})
+            row = {**p, "id": pid}
+            if norm_company(p.get("company")) in top_tier:
+                status = self._store.get_posting(pid)["status"]
+                if status == "new":
+                    self._store.set_posting_status(pid, "notify_only")
+                    alerts.append(self._notify_only_alert(row))
+                    status = "notify_only"
+                row["status"] = status
+            stored.append(row)
+        for text in alerts:
+            await self._send(text)
         return stored
+
+    def _notify_only_alert(self, posting: dict) -> str:
+        fields = [
+            f"Company: {_one_line(posting.get('company')) or '?'}",
+            f"Role: {_one_line(posting.get('role')) or '?'}",
+            f"URL: {_one_line(posting.get('url'))}",
+        ]
+        return NOTIFY_ONLY_TEXT + untrusted_block("\n".join(fields))
 
     def _scout_report(self, result: ScoutResult, stored: list[dict]) -> str:
         if not result.ok:
@@ -385,20 +487,64 @@ class JobScheduler:
 
     # --- apply ---
 
-    def _maybe_apply(self, now: datetime) -> None:
+    async def _maybe_apply(self, now: datetime) -> None:
         if self.applying or not self._cfg.jobs.in_apply_window(now.time()):
             return
         if self._paused_until is not None and now < self._paused_until:
             return
-        if self._counts(now.date()).get("chrome_failures", 0) > CHROME_RETRIES_PER_DAY:
-            return  # Chrome kept failing today: wait until tomorrow
-        posting = self._next_queued(self._allow_auto(now.date()))
-        if posting is None:
+        allow_auto = self._allow_auto(now.date())
+        if self._next_queued(allow_auto) is None:
             return
+        sources, complete = self._dedup_sources()
+        if not complete:
+            allow_auto = False  # a duplicate check we cannot run must not lead to an application
+        while True:
+            posting = self._next_queued(allow_auto)
+            if posting is None:
+                return
+            verdict = check_duplicate(posting, *sources)
+            requested = _is_requested(posting)
+            if verdict.kind == "none" or (verdict.kind == "possible" and requested):
+                break
+            label = "duplicate" if verdict.kind == "duplicate" else "possible duplicate"
+            detail = f"{label} of {verdict.detail}"
+            log.info("posting #%s skipped: %s", posting["id"], detail)
+            self._store.set_posting_status(posting["id"], "skipped", detail=detail)
+            if requested:
+                await self._send(self._apply_alert(posting, "skipped", detail))
+        error = self._preflight_fn(self._cfg)
+        if error is not None:
+            log.warning("jobagent preflight failed: %s; applications paused until tomorrow", error)
+            self._paused_until = datetime.combine(now.date() + timedelta(days=1), datetime.min.time())
+            today = now.date().isoformat()
+            if self._store.get_state(KEY_PREFLIGHT_NOTIFIED) != today:
+                self._store.set_state(KEY_PREFLIGHT_NOTIFIED, today)
+                await self._send(PREFLIGHT_TEXT.format(error=_one_line(error)))
+            return
+        note = f"possible duplicate of {verdict.detail}" if verdict.kind == "possible" else ""
         self._store.set_posting_status(posting["id"], "applying", detail=posting["status_detail"])
-        self._apply_task = asyncio.create_task(self._apply(posting), name="argus-jobs-apply")
+        self._apply_task = asyncio.create_task(self._apply(posting, note), name="argus-jobs-apply")
 
-    async def _apply(self, posting: dict) -> None:
+    def _dedup_sources(self) -> tuple[tuple[list[dict], list[dict], list[dict]], bool]:
+        """(tracker rows, submitted postings, jobagent log entries) for ``check_duplicate``, and
+        whether the tracker and jobagent's log could both be read (unreadable ones count as empty)."""
+        complete = True
+        tracker_rows: list[dict] = []
+        if self._tracker is not None:
+            try:
+                tracker_rows = self._tracker.rows()
+            except Exception:
+                log.exception("cannot read the applications tracker for the duplicate check")
+                complete = False
+        try:
+            jobagent_entries = read_jobagent_log(self._cfg.jobagent_live_dir / JOBAGENT_LOG_NAME)
+        except OSError:
+            log.exception("cannot read jobagent's applications log for the duplicate check")
+            jobagent_entries, complete = [], False
+        submitted = self._store.list_postings(status="submitted", limit=QUEUE_SCAN_LIMIT)
+        return (tracker_rows, submitted, jobagent_entries), complete
+
+    async def _apply(self, posting: dict, note: str = "") -> None:
         """One application run. The posting's status is always resolved (never left
         ``applying``): any failure is ``error``; a cancellation records it for the next start."""
         pid = posting["id"]
@@ -417,13 +563,15 @@ class JobScheduler:
             except Exception as e:
                 log.exception("apply run raised")
                 result = ApplyResult(result="error", detail=f"applier run failed: {e or type(e).__name__}")
+            if note:  # a requested posting that may duplicate an earlier application
+                result = replace(result, detail=f"{result.detail} ({note})".strip())
             alert = self._resolve(posting, result)
             resolved = True
-            ok = result.result not in ("error", "chrome_not_connected")
+            ok = result.result != "error"
             summary = f"#{pid} {posting.get('company')} — {posting.get('role')}: {result.result}: {result.detail}"
             log.info("application %s", summary)
             self._store.finish_job_run(run_id, self._now(), ok, summary, result.cost_usd)
-            if alert:
+            if alert and _is_requested(posting):  # automatic ones go to the run summary
                 await self._send(alert)
         except asyncio.CancelledError:
             if not resolved:
@@ -448,10 +596,9 @@ class JobScheduler:
         except Exception:
             log.exception("could not record interrupted posting %s", pid)
 
-    def _resolve(self, posting: dict, result: ApplyResult) -> str | None:
-        """Store the outcome of one run; return the alert text to send, if any."""
+    def _resolve(self, posting: dict, result: ApplyResult) -> str:
+        """Store the outcome of one run; return its alert text (sent only for requested postings)."""
         pid, now = posting["id"], self._now()
-        prev = posting.get("status_detail") or ""
         kind = result.result
         if kind == "submitted":
             detail = result.detail
@@ -461,19 +608,8 @@ class JobScheduler:
                                            follow_up=result.follow_up)
             if not _is_requested(posting):
                 self._bump(now.date(), "auto_submitted")
-            return None
-        if kind == "chrome_not_connected":
-            self._store.set_posting_status(pid, "queued", detail=prev or None)
-            failures = self._bump(now.date(), "chrome_failures")["chrome_failures"]
-            if failures > CHROME_RETRIES_PER_DAY:
-                self._paused_until = datetime.combine(now.date() + timedelta(days=1), datetime.min.time())
-            else:
-                self._paused_until = now + CHROME_PAUSE
-            today = now.date().isoformat()
-            if self._store.get_state(KEY_CHROME_NOTIFIED) != today:
-                self._store.set_state(KEY_CHROME_NOTIFIED, today)
-                return CHROME_TEXT
-            return None
+            self._record_application(posting, result, now.date())
+            return self._apply_alert(posting, kind, detail)
         if kind == "needs_user":
             detail = f"{NEEDS_USER_PREFIX}{result.detail}".strip() or None
             self._store.set_posting_status(pid, NEEDS_USER_STATUS, detail=detail, follow_up=result.follow_up)
@@ -483,7 +619,24 @@ class JobScheduler:
             self._store.set_posting_status(pid, kind, detail=result.detail or None, follow_up=result.follow_up)
             return self._apply_alert(posting, kind, result.detail)
         self._store.set_posting_status(pid, "skipped", detail=result.detail or None)
-        return None
+        return self._apply_alert(posting, "skipped", result.detail)
+
+    def _record_application(self, posting: dict, result: ApplyResult, day: date) -> None:
+        """Add a submitted application to the tracker and re-render its Markdown; never raises."""
+        if self._tracker is None:
+            return
+        try:
+            company = result.company or posting.get("company") or ""
+            role = result.role or posting.get("role") or ""
+            city, url = posting.get("city") or "", posting.get("url")
+            self._tracker.add_application(
+                applied_date=day, company=company, role=role, city=city, start=posting.get("term") or "",
+                region=tracker_region(city, company), url=url,
+                req_id=req_id(url) or req_id(posting.get("role")), posting_id=posting["id"],
+            )
+            self._tracker.render_markdown()
+        except Exception:
+            log.exception("could not add posting #%s to the applications tracker", posting.get("id"))
 
     def _apply_alert(self, posting: dict, kind: str, detail: str) -> str:
         fields = [
