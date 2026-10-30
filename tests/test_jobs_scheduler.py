@@ -886,3 +886,52 @@ def test_default_apply_fn_is_jobagent(tmp_path):
     assert s._apply_fn.func is apply_with_jobagent
     assert s._apply_fn.keywords == {"reader": reader, "relay": s.relay}
     store.close()
+
+
+# --- fix round 1: missing tracker, notify-only defense in depth, unreadable jobagent log ---
+
+async def test_no_tracker_blocks_automatic_but_not_requested(tmp_path):
+    env = make_env(tmp_path)
+    env.sched._tracker = None
+    _scouted(env)
+    auto = env.add(U("a"), fit=5)
+    await env.step()
+    assert env.status(auto) == "queued" and env.apply.calls == []
+    req = env.add(U("r"), fit=2)
+    env.sched.request_apply(req)
+    await env.step()
+    assert [c["url"] for c in env.apply.calls] == [U("r")] and env.status(req) == "submitted"
+    assert env.status(auto) == "queued"
+    env.store.close()
+
+
+async def test_existing_new_notify_only_row_is_never_applied(env):
+    _scouted(env)
+    pid = env.add(U("goog"), fit=5, company="Google")
+    await env.step()
+    await env.step()
+    assert env.status(pid) == "notify_only" and env.apply.calls == []
+
+
+async def test_queued_notify_only_row_is_skipped(env):
+    _scouted(env)
+    pid = env.add(U("goog"), fit=5, company="Google", status="queued")
+    other = env.add(U("ok"), fit=5)
+    await env.step()
+    p = env.store.get_posting(pid)
+    assert p["status"] == "skipped" and p["status_detail"] == "notify-only company"
+    assert [c["url"] for c in env.apply.calls] == [U("ok")] and env.status(other) == "submitted"
+
+
+async def test_unreadable_jobagent_log_blocks_automatic_and_logs_once(env, caplog):
+    _scouted(env)
+    (env.cfg.jobagent_live_dir / "applications.jsonl").mkdir(parents=True)
+    auto = env.add(U("a"), fit=5)
+    for _ in range(3):
+        await env.step()
+    assert env.status(auto) == "queued" and env.apply.calls == []
+    assert caplog.text.count("cannot read jobagent's applications log") == 1
+    (env.cfg.jobagent_live_dir / "applications.jsonl").rmdir()
+    await env.step()
+    assert env.status(auto) == "submitted"
+    assert "recovered" in caplog.text

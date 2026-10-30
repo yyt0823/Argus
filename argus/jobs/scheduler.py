@@ -17,14 +17,17 @@
 Notify-only companies (``jobs.notify_only_companies``, compared with ``dedup.norm_company``): a
 scouted ``new`` posting of such a company becomes ``notify_only`` and the user gets one alert
 right away. It is never queued automatically (upsert keeps the status, so the alert is sent once).
+Older rows are covered too: ``_queue_auto`` turns a ``new`` notify-only posting into
+``notify_only`` (no alert), and a non-requested ``queued`` one is ``skipped`` ("notify-only
+company") instead of applied.
 
 Before a posting becomes ``applying``, ``dedup.check_duplicate`` compares it with the
 applications tracker, earlier Argus submissions and jobagent's own log. A ``duplicate`` is
 ``skipped`` ("duplicate of ...") and never applied; a ``possible`` duplicate is ``skipped``
 ("possible duplicate of ...") unless the user requested it explicitly, in which case it is applied
-and the note is added to the result detail. Skips are not runs. If the tracker or jobagent's log
-cannot be read, no automatic application starts that tick (requested ones are still checked
-against what could be read). Then ``jobagent_applier.preflight``: if jobagent cannot be used, the
+and the note is added to the result detail. Skips are not runs. If there is no tracker, or the
+tracker or jobagent's log cannot be read, no automatic application starts that tick (requested
+ones are still checked against what could be read). Then ``jobagent_applier.preflight``: if jobagent cannot be used, the
 posting stays ``queued``, applications pause until the next day and the user gets one alert per day.
 
 Limits: a scout run times out after 45 min, an application after ``apply_timeout`` (result
@@ -276,6 +279,7 @@ class JobScheduler:
         self._report_scout = False
         self._paused_until: datetime | None = None
         self._recovered = False
+        self._dedup_problems: frozenset[str] = frozenset()  # unreadable duplicate-check sources, logged once
 
     # --- status for tools ---
 
@@ -384,7 +388,6 @@ class JobScheduler:
     async def _store_postings(self, postings: list[dict]) -> list[dict]:
         """Upsert the scout's postings; a ``new`` posting of a notify-only company becomes
         ``notify_only`` and is alerted once."""
-        top_tier = {norm_company(c) for c in self._cfg.jobs.notify_only_companies} - {""}
         stored, alerts = [], []
         for p in postings:
             try:
@@ -394,7 +397,7 @@ class JobScheduler:
                 log.warning("skipping invalid posting %r: %s", p.get("url"), e)
                 continue
             row = {**p, "id": pid}
-            if norm_company(p.get("company")) in top_tier:
+            if self._is_notify_only(p):
                 status = self._store.get_posting(pid)["status"]
                 if status == "new":
                     self._store.set_posting_status(pid, "notify_only")
@@ -405,6 +408,10 @@ class JobScheduler:
         for text in alerts:
             await self._send(text)
         return stored
+
+    def _is_notify_only(self, posting: dict) -> bool:
+        company = norm_company(posting.get("company"))
+        return bool(company) and company in {norm_company(c) for c in self._cfg.jobs.notify_only_companies}
 
     def _notify_only_alert(self, posting: dict) -> str:
         fields = [
@@ -453,7 +460,9 @@ class JobScheduler:
             limit=QUEUE_SCAN_LIMIT,
         )
         for p in rows:
-            if auto_apply_eligible(p):  # others are reported only
+            if self._is_notify_only(p):  # e.g. stored before its company was on the list
+                self._store.set_posting_status(p["id"], "notify_only")
+            elif auto_apply_eligible(p):  # others are reported only
                 self._store.set_posting_status(p["id"], "queued")
 
     def _next_queued(self, allow_auto: bool) -> dict | None:
@@ -502,8 +511,12 @@ class JobScheduler:
             posting = self._next_queued(allow_auto)
             if posting is None:
                 return
-            verdict = check_duplicate(posting, *sources)
             requested = _is_requested(posting)
+            if not requested and self._is_notify_only(posting):  # never applied automatically
+                log.info("posting #%s skipped: notify-only company", posting["id"])
+                self._store.set_posting_status(posting["id"], "skipped", detail="notify-only company")
+                continue
+            verdict = check_duplicate(posting, *sources)
             if verdict.kind == "none" or (verdict.kind == "possible" and requested):
                 break
             label = "duplicate" if verdict.kind == "duplicate" else "possible duplicate"
@@ -527,22 +540,31 @@ class JobScheduler:
 
     def _dedup_sources(self) -> tuple[tuple[list[dict], list[dict], list[dict]], bool]:
         """(tracker rows, submitted postings, jobagent log entries) for ``check_duplicate``, and
-        whether the tracker and jobagent's log could both be read (unreadable ones count as empty)."""
-        complete = True
+        whether the tracker and jobagent's log could both be read (a missing tracker or an
+        unreadable source counts as empty and makes the check incomplete). Problems are logged
+        when they start and when they clear, not every tick."""
+        problems: dict[str, BaseException | None] = {}
         tracker_rows: list[dict] = []
-        if self._tracker is not None:
+        if self._tracker is None:
+            problems["the applications tracker is not available"] = None
+        else:
             try:
                 tracker_rows = self._tracker.rows()
-            except Exception:
-                log.exception("cannot read the applications tracker for the duplicate check")
-                complete = False
+            except Exception as e:
+                problems["cannot read the applications tracker"] = e
         try:
             jobagent_entries = read_jobagent_log(self._cfg.jobagent_live_dir / JOBAGENT_LOG_NAME)
-        except OSError:
-            log.exception("cannot read jobagent's applications log for the duplicate check")
-            jobagent_entries, complete = [], False
+        except OSError as e:
+            problems["cannot read jobagent's applications log"] = e
+            jobagent_entries = []
+        for what in problems.keys() - self._dedup_problems:
+            log.error("%s; duplicate check incomplete, no automatic applications", what,
+                      exc_info=problems[what])
+        for what in self._dedup_problems - problems.keys():
+            log.warning("duplicate check source recovered (was: %s)", what)
+        self._dedup_problems = frozenset(problems)
         submitted = self._store.list_postings(status="submitted", limit=QUEUE_SCAN_LIMIT)
-        return (tracker_rows, submitted, jobagent_entries), complete
+        return (tracker_rows, submitted, jobagent_entries), not problems
 
     async def _apply(self, posting: dict, note: str = "") -> None:
         """One application run. The posting's status is always resolved (never left
