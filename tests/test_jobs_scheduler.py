@@ -935,3 +935,192 @@ async def test_unreadable_jobagent_log_blocks_automatic_and_logs_once(env, caplo
     await env.step()
     assert env.status(auto) == "submitted"
     assert "recovered" in caplog.text
+
+
+# --- end-of-run summary ---
+
+SUMMARY_END = "Send ONE concise message."
+
+
+class FakeReader:
+    def __init__(self, max_id=100, mails=(), bodies=None):
+        self.max = max_id
+        self.mails = list(mails)
+        self.bodies = bodies or {}
+        self.read: list[int] = []
+
+    def max_id(self):
+        return self.max
+
+    def inbox_since(self, after_id, limit=200):
+        return [m for m in self.mails if m.id > after_id][:limit]
+
+    def read_body(self, id, max_chars=20000):
+        self.read.append(id)
+        return self.bodies.get(id, "body")[:max_chars]
+
+
+class FakeEmailRunner:
+    def __init__(self, *replies):
+        self.replies = list(replies)
+        self.calls: list[str] = []
+
+    async def __call__(self, system_prompt, user_prompt, model):
+        self.calls.append(user_prompt)
+        reply = self.replies.pop(0) if self.replies else "[]"
+        if isinstance(reply, Exception):
+            raise reply
+        return reply
+
+
+def _mail(i, subject="Application update"):
+    from argus.mail.reader import MailSummary
+    return MailSummary(id=i, account="Gmail", sender="hr@x.com", subject=subject,
+                       received_at=DAY.replace(hour=9), snippet="", read=False)
+
+
+def summary_env(tmp_path, reader=None, runner=None, tracker=True, **kw):
+    env = make_env(tmp_path, **kw)
+    env.reader = reader
+    env.runner = runner or FakeEmailRunner()
+
+    async def submit(text):
+        env.sent.append(text)
+
+    env.sched = JobScheduler(env.cfg, env.store, submit, scout_fn=env.scout, apply_fn=env.apply,
+                             now=env.clock, tracker=env.tracker if tracker else None, reader=reader,
+                             preflight_fn=lambda cfg: env.preflight_error, email_runner=env.runner)
+    return env
+
+
+def summaries(env):
+    return [t for t in env.sent if t.rstrip().endswith(SUMMARY_END)]
+
+
+def run_state(env):
+    raw = env.store.get_state("jobs_run")
+    return json.loads(raw) if raw else None
+
+
+async def test_summary_runs_once_after_wait(tmp_path):
+    reader = FakeReader(max_id=100, mails=[_mail(101, "Thanks for applying"), _mail(102, "Shoe sale"),
+                                           _mail(103, "Old news")])
+    runner = FakeEmailRunner(json.dumps([
+        {"id": 101, "job_related": True, "kind": "confirmation", "company": "Acme Corp", "role": None,
+         "summary": "Application received"},
+        {"id": 102, "job_related": False},
+    ]))
+    env = summary_env(tmp_path, reader, runner, at=DAY.replace(hour=7, minute=30))
+    acme = env.tracker.add_application(applied_date=DAY.date(), company="Acme Corp", role="Dev Intern",
+                                       city="Montréal", start="Jan 2027")
+    env.tracker.add_email_event(email_date="2026-10-14", account="Gmail", sender="hr@x.com", subject="Old",
+                                company="Acme Corp", role="", kind="update", summary="old", mail_rowid=103)
+    await env.step()  # the daily scout starts and finishes
+    state = run_state(env)
+    assert state["day"] == "2026-10-14" and state["mail_after_id"] == 100
+    assert state["scout_done"] is True and state["summary_sent"] is False
+
+    env.clock.at = DAY.replace(hour=7, minute=31)
+    await env.step()  # scout done, queue empty: work done now
+    assert run_state(env)["work_done_at"] == DAY.replace(hour=7, minute=31).isoformat()
+    env.clock.at = DAY.replace(hour=7, minute=50)
+    await env.step()
+    assert summaries(env) == [] and runner.calls == []
+
+    env.clock.at = DAY.replace(hour=7, minute=51)
+    await env.step()
+    [text] = summaries(env)
+    assert text.startswith(INTERNAL_PREFIX) and "Confirmations: 1" in text
+    assert run_state(env)["summary_sent"] is True
+    [prompt] = runner.calls
+    assert "Thanks for applying" in prompt and "Shoe sale" in prompt and "Old news" not in prompt
+    assert 103 not in reader.read
+    assert {r["id"]: r["status"] for r in env.tracker.rows()}[acme] == "Confirmed"
+
+    for at in (DAY.replace(hour=8, minute=30), DAY.replace(hour=23)):
+        env.clock.at = at
+        await env.step()
+    assert len(summaries(env)) == 1 and len(runner.calls) == 1
+    env.store.close()
+
+
+async def test_summary_after_window_close_with_queue_left(tmp_path):
+    env = summary_env(tmp_path, FakeReader(), at=DAY.replace(hour=9))
+    env.preflight_error = "jobagent not found"  # applications pause: the queue never drains
+    auto = env.add(U("a"), fit=5, status="queued")
+    await env.step()
+    env.clock.at = DAY.replace(hour=21, minute=59)
+    await env.step()
+    assert summaries(env) == [] and run_state(env)["work_done_at"] is None
+    env.clock.at = DAY.replace(hour=22)
+    await env.step()
+    assert run_state(env)["work_done_at"] == DAY.replace(hour=22).isoformat()
+    env.clock.at = DAY.replace(hour=22, minute=19)
+    await env.step()
+    assert summaries(env) == []
+    env.clock.at = DAY.replace(hour=22, minute=20)
+    await env.step()
+    assert len(summaries(env)) == 1 and env.status(auto) == "queued"
+    env.store.close()
+
+
+async def test_summary_after_daily_limit_lists_submissions_and_accounts(tmp_path):
+    env = summary_env(tmp_path, FakeReader(), at=DAY.replace(hour=9), daily_apply_limit=1)
+    a = env.add(U("a"), fit=5, status="queued", seen=DAY - timedelta(days=1))
+    b = env.add(U("b"), fit=5, status="queued")
+    env.apply.default = ApplyResult(result="submitted", detail="done",
+                                    accounts_created=("acme.wd1.myworkdayjobs.com",))
+    await env.step()
+    assert env.status(a) == "submitted" and env.status(b) == "queued"
+    assert run_state(env)["accounts_created"] == ["acme.wd1.myworkdayjobs.com"]
+    assert env.sent == []  # automatic applications send nothing
+    env.clock.at = DAY.replace(hour=9, minute=1)
+    await env.step()
+    assert run_state(env)["work_done_at"] is not None
+    env.clock.at = DAY.replace(hour=9, minute=21)
+    await env.step()
+    [text] = summaries(env)
+    assert "Acme a — SWE Intern" in text and "acme.wd1.myworkdayjobs.com" in text
+    env.store.close()
+
+
+async def test_requested_apply_creates_no_run(tmp_path):
+    env = summary_env(tmp_path, FakeReader(), at=DAY.replace(hour=9), scout_time=time(23, 30))
+    pid = env.add(U("r"), fit=2)
+    env.sched.request_apply(pid)
+    await env.step()
+    assert env.status(pid) == "submitted" and len(env.sent) == 1  # its own alert
+    for minutes in (30, 120, 600):
+        env.clock.at = DAY.replace(hour=9) + timedelta(minutes=minutes)
+        await env.step()
+    assert run_state(env) is None and summaries(env) == []
+    env.store.close()
+
+
+async def test_summary_after_midnight_when_work_ends_late(tmp_path):
+    env = summary_env(tmp_path, FakeReader(), at=DAY.replace(hour=23, minute=50),
+                      scout_time=time(23, 50), apply_window=(time(8, 30), time(23, 59)))
+    await env.step()
+    env.clock.at = DAY.replace(hour=23, minute=51)
+    await env.step()
+    assert run_state(env)["work_done_at"] is not None
+    env.clock.at = DAY.replace(hour=0, minute=11) + timedelta(days=1)
+    await env.step()
+    assert len(summaries(env)) == 1
+    env.store.close()
+
+
+async def test_summary_without_tracker_and_failed_classification(tmp_path, caplog):
+    from argus.mail.triage import TriageError
+    reader = FakeReader(max_id=100, mails=[_mail(101)])
+    env = summary_env(tmp_path, reader, FakeEmailRunner(TriageError("model down")), tracker=False,
+                      at=DAY.replace(hour=9))
+    await env.step()
+    env.clock.at = DAY.replace(hour=9, minute=1)
+    await env.step()
+    env.clock.at = DAY.replace(hour=9, minute=21)
+    await env.step()
+    [text] = summaries(env)
+    assert "1 email(s)" in text
+    assert "model down" in caplog.text
+    env.store.close()

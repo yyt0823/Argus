@@ -40,6 +40,17 @@ Automatic ones send nothing; the end-of-run summary reports them. A ``submitted`
 also added to the applications tracker (``ApplicationsTracker.add_application`` +
 ``render_markdown``); tracker errors are logged, never raised.
 
+End-of-run summary (``argus.jobs.summary``): the daily scout start creates the run state
+(``jobs_run``; ``mail_after_id`` is the Mail reader's ``max_id`` then, or None without a reader).
+The day's work is done once the scout has finished and no automatic posting is ``applying``, and
+either no automatic posting is ``queued``, the apply window has closed, or the daily automatic
+limit is reached (a run from an earlier day is done as soon as nothing automatic is applying).
+``work_done_at`` is set once; ``summary_mail_wait_minutes`` later (time for confirmation mail)
+the summary runs once in the background (``summary_sent`` is set first): it reads the inbox since
+``mail_after_id`` (skipping mails already in the tracker's ``email_events``), classifies the job
+emails, updates the tracker and submits one internal task. Requested applications neither create
+nor extend a run, but their accounts and postings are noted in a pending run like automatic ones.
+
 An application ``error`` is never retried automatically (a failed run may still have
 submitted). The user can re-request it with ``job_apply``; the applier is then told to check
 for an earlier submission first (``PRIOR_ATTEMPT`` in ``status_detail``).
@@ -58,6 +69,8 @@ State keys (``Store.get_state``/``set_state``):
 - ``jobs_day_counts``: JSON ``{"day", "runs", "auto_runs", "auto_submitted"}`` for the current day.
 - ``jobs_interrupted``: comma-separated posting ids interrupted by a shutdown, alerted on the
   next start.
+- ``jobs_run``: JSON ``{"day", "started_at", "mail_after_id", "scout_done", "work_done_at",
+  "summary_sent", "accounts_created", "posting_ids"}`` for the latest daily run.
 """
 
 from __future__ import annotations
@@ -80,8 +93,10 @@ from argus.jobs.guard import auto_apply_eligible
 from argus.jobs.human_relay import HumanRelay
 from argus.jobs.jobagent_applier import apply_with_jobagent, preflight
 from argus.jobs.scout import ScoutResult, run_scout
+from argus.jobs.summary import BODY_CHARS, apply_email_events, build_summary_task, classify_job_emails
 from argus.jobs.tracker import ApplicationsTracker
-from argus.mail.reader import MailReader
+from argus.mail import triage
+from argus.mail.reader import MailReader, MailReaderError
 from argus.mail.watcher import INTERNAL_PREFIX
 from argus.store import JOB_STATUSES
 
@@ -91,6 +106,7 @@ TICK_SECONDS = 60
 QUEUE_MAX_AGE = timedelta(days=7)
 SCOUT_TIMEOUT = 45 * 60.0  # seconds
 QUEUE_SCAN_LIMIT = 1000
+SUMMARY_MAIL_LIMIT = 500  # inbox messages read for one run summary
 
 
 def apply_timeout(cfg: Config) -> float:
@@ -102,6 +118,7 @@ KEY_LAST_SCOUT = "jobs_last_scout"
 KEY_PREFLIGHT_NOTIFIED = "jobs_preflight_notified"
 KEY_DAY_COUNTS = "jobs_day_counts"
 KEY_INTERRUPTED = "jobs_interrupted"
+KEY_RUN = "jobs_run"
 
 REQUESTED = "requested"
 INTERRUPTED_DETAIL = "interrupted during application — check manually"
@@ -259,10 +276,11 @@ class JobScheduler:
         tracker: ApplicationsTracker | None = None,
         reader: MailReader | None = None,
         preflight_fn: Callable[[Config], str | None] = preflight,
+        email_runner: triage.Runner = triage.sdk_runner,
     ) -> None:
         """``apply_fn`` defaults to jobagent with ``reader`` (the Mail reader, or None) and
         ``self.relay``; ``tracker`` (or None) is used for the duplicate check and gets a row per
-        submission."""
+        submission. ``reader`` and ``email_runner`` (the model call) feed the run summary."""
         self._cfg = cfg
         self._store = store
         self.submit = submit  # public: main wires it to App.submit_internal after the App exists
@@ -272,10 +290,13 @@ class JobScheduler:
             apply_fn = functools.partial(apply_with_jobagent, reader=reader, relay=self.relay)
         self._apply_fn = apply_fn
         self._tracker = tracker
+        self._reader = reader
+        self._email_runner = email_runner
         self._preflight_fn = preflight_fn
         self._now = now
         self._scout_task: asyncio.Task | None = None
         self._apply_task: asyncio.Task | None = None
+        self._summary_task: asyncio.Task | None = None
         self._report_scout = False
         self._paused_until: datetime | None = None
         self._recovered = False
@@ -304,13 +325,13 @@ class JobScheduler:
                     log.exception("jobs tick failed")
                 await asyncio.sleep(TICK_SECONDS)
         finally:
-            for task in (self._scout_task, self._apply_task):
+            for task in (self._scout_task, self._apply_task, self._summary_task):
                 if task is not None and not task.done():
                     task.cancel()
 
     async def wait_idle(self) -> None:
-        """Wait until the background scout and application (if any) have finished."""
-        for task in (self._scout_task, self._apply_task):
+        """Wait until the background scout, application and summary (if any) have finished."""
+        for task in (self._scout_task, self._apply_task, self._summary_task):
             if task is not None:
                 await asyncio.gather(task, return_exceptions=True)
 
@@ -318,10 +339,11 @@ class JobScheduler:
         now = self._now()
         if not self._recovered:
             await self._recover()
-        self._maybe_daily_scout(now)
+        await self._maybe_daily_scout(now)
         if self._cfg.jobs.auto_apply:
             self._queue_auto(now)
         await self._maybe_apply(now)
+        self._maybe_summarize(now)
 
     # --- requests (chat tools) ---
 
@@ -346,13 +368,28 @@ class JobScheduler:
 
     # --- scout ---
 
-    def _maybe_daily_scout(self, now: datetime) -> None:
+    async def _maybe_daily_scout(self, now: datetime) -> None:
         today = now.date().isoformat()
         if now.time() < self._cfg.jobs.scout_time or self._store.get_state(KEY_LAST_SCOUT) == today:
             return
         self._store.set_state(KEY_LAST_SCOUT, today)  # first: never twice a day
+        await self._start_run(now)
         if not self.scouting:
             self._start_scout()
+
+    async def _start_run(self, now: datetime) -> None:
+        """Create today's run state (replacing an earlier day's)."""
+        mail_after_id = None
+        if self._reader is not None:
+            try:
+                mail_after_id = await asyncio.to_thread(self._reader.max_id)
+            except Exception:
+                log.exception("cannot read the mailbox position; the run summary will have no emails")
+        self._save_run({
+            "day": now.date().isoformat(), "started_at": now.isoformat(timespec="seconds"),
+            "mail_after_id": mail_after_id, "scout_done": False, "work_done_at": None,
+            "summary_sent": False, "accounts_created": [], "posting_ids": [],
+        })
 
     def _start_scout(self) -> None:
         self._scout_task = asyncio.create_task(self._scout(), name="argus-jobs-scout")
@@ -378,6 +415,7 @@ class JobScheduler:
             self._store.finish_job_run(run_id, self._now(), result.ok, summary, result.cost_usd)
             log.info("scout finished: ok=%s, %d posting(s), cost=%s", result.ok, len(stored), result.cost_usd)
         finally:
+            self._note_run(scout_done=True)
             # A daily scout that finishes after today's briefing went out reports on its own, since
             # the briefing told the user results would follow.
             late_daily = bool(stored) and self._store.get_state("briefing_last_sent") == started.date().isoformat()
@@ -515,6 +553,7 @@ class JobScheduler:
             if not requested and self._is_notify_only(posting):  # never applied automatically
                 log.info("posting #%s skipped: notify-only company", posting["id"])
                 self._store.set_posting_status(posting["id"], "skipped", detail="notify-only company")
+                self._note_run(posting_id=posting["id"])
                 continue
             verdict = check_duplicate(posting, *sources)
             if verdict.kind == "none" or (verdict.kind == "possible" and requested):
@@ -523,6 +562,7 @@ class JobScheduler:
             detail = f"{label} of {verdict.detail}"
             log.info("posting #%s skipped: %s", posting["id"], detail)
             self._store.set_posting_status(posting["id"], "skipped", detail=detail)
+            self._note_run(posting_id=posting["id"])
             if requested:
                 await self._send(self._apply_alert(posting, "skipped", detail))
         error = self._preflight_fn(self._cfg)
@@ -621,6 +661,7 @@ class JobScheduler:
     def _resolve(self, posting: dict, result: ApplyResult) -> str:
         """Store the outcome of one run; return its alert text (sent only for requested postings)."""
         pid, now = posting["id"], self._now()
+        self._note_run(posting_id=pid, accounts=result.accounts_created)
         kind = result.result
         if kind == "submitted":
             detail = result.detail
@@ -668,6 +709,136 @@ class JobScheduler:
             f"Detail: {_one_line(detail) or '(none)'}",
         ]
         return APPLY_ALERT_HEAD.format(what=APPLY_ALERT_TEXT[kind]) + untrusted_block("\n".join(fields))
+
+    # --- end-of-run summary ---
+
+    def _run_state(self) -> dict | None:
+        try:
+            run = json.loads(self._store.get_state(KEY_RUN) or "null")
+        except ValueError:
+            return None
+        return run if isinstance(run, dict) and run.get("day") else None
+
+    def _save_run(self, run: dict) -> None:
+        self._store.set_state(KEY_RUN, json.dumps(run))
+
+    def _note_run(self, *, scout_done: bool = False, posting_id: int | None = None,
+                  accounts: tuple[str, ...] = ()) -> None:
+        """Record progress in the pending run (if any); never raises."""
+        try:
+            run = self._run_state()
+            if run is None or run.get("summary_sent"):
+                return
+            if scout_done:
+                run["scout_done"] = True
+            if posting_id is not None and posting_id not in run.setdefault("posting_ids", []):
+                run["posting_ids"].append(posting_id)
+            created = run.setdefault("accounts_created", [])
+            created.extend(a for a in dict.fromkeys(accounts) if a and a not in created)
+            self._save_run(run)
+        except Exception:
+            log.exception("could not update the jobs run state")
+
+    def _work_done(self, run: dict, now: datetime) -> bool:
+        if not run.get("scout_done") and self.scouting:
+            return False  # after a restart mid-scout, scout_done stays False: not scouting is enough
+        active = [
+            p for status in ("applying", "queued")
+            for p in self._store.list_postings(status=status, limit=QUEUE_SCAN_LIMIT)
+            if not _is_requested(p)
+        ]
+        if any(p["status"] == "applying" for p in active):
+            return False
+        if run["day"] != now.date().isoformat() or now.time() >= self._cfg.jobs.apply_window[1]:
+            return True
+        return not self._allow_auto(now.date()) or not active
+
+    def _maybe_summarize(self, now: datetime) -> None:
+        run = self._run_state()
+        if run is None or run.get("summary_sent"):
+            return
+        done_at = None
+        try:
+            done_at = datetime.fromisoformat(run["work_done_at"]) if run.get("work_done_at") else None
+        except (TypeError, ValueError):
+            pass
+        if done_at is None:
+            if not self._work_done(run, now):
+                return
+            done_at = now
+            run["work_done_at"] = now.isoformat(timespec="seconds")
+            self._save_run(run)
+        if now < done_at + timedelta(minutes=self._cfg.jobs.summary_mail_wait_minutes):
+            return
+        run["summary_sent"] = True  # first: one attempt only
+        self._save_run(run)
+        self._summary_task = asyncio.create_task(self._summarize(run), name="argus-jobs-summary")
+
+    async def _summarize(self, run: dict) -> None:
+        try:
+            postings = self._run_postings(run)
+            mails, mail_error = await self._run_mails(run)
+            failed: list = []
+            events = await classify_job_emails(mails, self._cfg.mail.triage_model, self._email_runner,
+                                               failed=failed)
+            unmatched: list[str] = []
+            if self._tracker is not None and events:
+                try:
+                    unmatched = await asyncio.to_thread(apply_email_events, self._tracker, events)
+                except Exception:
+                    log.exception("could not update the applications tracker from job emails")
+            text = build_summary_task(run, postings, events, unmatched, run.get("accounts_created") or [],
+                                      unclassified=len(failed), mail_error=mail_error)
+        except Exception:
+            log.exception("jobs run summary failed")
+            return
+        log.info("jobs run summary: %d posting(s), %d job email(s)", len(postings), len(events))
+        await self._send(text)
+
+    def _run_postings(self, run: dict) -> list[dict]:
+        """Postings the run changed: first seen or applied since it started, or touched by it."""
+        try:
+            started = datetime.fromisoformat(run["started_at"])
+        except (KeyError, TypeError, ValueError):
+            started = datetime.combine(date.fromisoformat(run["day"]), datetime.min.time())
+        since = started.isoformat(timespec="seconds")
+        found = {p["id"]: p for p in self._store.list_postings(since=started, limit=QUEUE_SCAN_LIMIT)}
+        for p in self._store.list_postings(status="submitted", limit=QUEUE_SCAN_LIMIT):
+            if (p.get("applied_at") or "") >= since:
+                found[p["id"]] = p
+        for pid in run.get("posting_ids") or []:
+            if pid not in found and (p := self._store.get_posting(pid)) is not None:
+                found[pid] = p
+        return sorted(found.values(), key=lambda p: p["id"])
+
+    async def _run_mails(self, run: dict) -> tuple[list[tuple], bool]:
+        """(summary, body) of inbox mails since the run started, minus those already recorded, and
+        whether the mailbox could not be read."""
+        after_id = run.get("mail_after_id")
+        if self._reader is None or not isinstance(after_id, int):
+            return [], self._reader is not None
+        recorded: set[int] = set()
+        if self._tracker is not None:
+            try:
+                recorded = self._tracker.recorded_mail_ids()
+            except Exception:
+                log.exception("cannot read recorded email events; every mail is classified again")
+        try:
+            new = await asyncio.to_thread(self._reader.inbox_since, after_id, limit=SUMMARY_MAIL_LIMIT)
+        except Exception:
+            log.exception("cannot read the inbox for the jobs run summary")
+            return [], True
+        mails = []
+        for m in new:
+            if m.id in recorded:
+                continue
+            try:
+                body = await asyncio.to_thread(self._reader.read_body, m.id, BODY_CHARS)
+            except MailReaderError as e:
+                log.warning("cannot read mail %s for the run summary: %s", m.id, e)
+                body = m.snippet
+            mails.append((m, body))
+        return mails, False
 
     async def _send(self, text: str) -> None:
         if self.submit is None:

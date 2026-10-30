@@ -175,6 +175,15 @@ class ApplicationsTracker:
         finally:
             conn.close()
 
+    def recorded_mail_ids(self) -> set[int]:
+        """Mail ids (``email_events.mail_rowid``) already recorded."""
+        conn = self._connect()
+        try:
+            rows = conn.execute("SELECT mail_rowid FROM email_events WHERE mail_rowid IS NOT NULL")
+            return {int(r["mail_rowid"]) for r in rows}
+        finally:
+            conn.close()
+
     def rows(self) -> list[dict]:
         conn = self._connect()
         try:
