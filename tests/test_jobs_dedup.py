@@ -80,3 +80,47 @@ def test_helpers():
     assert req_id("Engineer") is None
     assert role_tokens("Summer 2027 Data Intern") == {"data"}
     assert jaccard(set(), set()) == 0.0
+
+
+WD = "https://acme.wd3.myworkdayjobs.com/{loc}External/job/Montreal/Data-Intern_{rid}"
+
+
+def test_req_id_after_underscore_in_workday_url():
+    assert req_id("https://x.com/job/Data-Intern_R155233-1") == "R155233"
+    assert req_id("https://x.com/job/Dev_JR1234") == "JR1234"
+    assert req_id("https://x.com/job/Dev_REQ-99") == "REQ-99"
+
+
+def test_dedup_workday_url_with_and_without_locale():
+    posting = {"company": "Acme", "role": "A", "url": WD.format(loc="en-US/", rid="R155233-1")}
+    rows = [_row(1, "Zed", "B", url=WD.format(loc="", rid="R155233-1"))]
+    assert check_duplicate(posting, rows, [], []).kind == "duplicate"
+    assert norm_url("http://www.X.com/fr-CA/jobs/1/") == norm_url("https://x.com/jobs/1")
+    assert norm_url("https://x.com/en/jobs") == norm_url("https://x.com/jobs")
+
+
+def test_dedup_company_suffix_variants():
+    assert norm_company("Intact Financial Corporation") == norm_company("Intact Financial")
+    assert norm_company("Acme Co.") == norm_company("Acme Limited") == norm_company("ACME LLC")
+    assert norm_company("Intact Financial") != norm_company("Intact")
+    assert norm_company("Montréal Inc") == norm_company("Montreal")
+
+
+def test_dedup_identical_raw_role_without_req_is_duplicate():
+    posting = {"company": "Coveo", "role": "Backend Developer Intern", "url": "https://c.com/1"}
+    rows = [_row(1, "Coveo", "backend  developer intern")]
+    assert check_duplicate(posting, rows, [], []).kind == "duplicate"
+
+
+def test_dedup_roles_equal_after_stopwords_only_is_possible():
+    posting = {"company": "Coveo", "role": "Backend Developer Intern Winter 2027", "url": "https://c.com/1"}
+    rows = [_row(1, "Coveo", "Backend Developer Intern Summer 2027")]
+    assert check_duplicate(posting, rows, [], []).kind == "possible"
+
+
+def test_dedup_req_id_formats_compare_by_digits():
+    posting = {"company": "Intact", "role": "Intern R155233", "url": "https://a.com/1"}
+    rows = [_row(1, "Intact", "Other", req="155233")]
+    assert check_duplicate(posting, rows, [], []).kind == "duplicate"
+    rows = [_row(1, "Intact", "Intern", req="r155233"), _row(2, "Intact", "Intern", req="155234")]
+    assert check_duplicate(posting, rows, [], []).kind == "duplicate"

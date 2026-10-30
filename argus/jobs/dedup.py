@@ -8,11 +8,16 @@ because later tasks reuse them.
 from __future__ import annotations
 
 import re
+import unicodedata
 from dataclasses import dataclass
 from typing import Literal
 from urllib.parse import parse_qsl, urlencode, urlsplit
 
-_COMPANY_STOPWORDS = {"inc", "ltd", "corp", "canada", "group", "technologies"}
+_COMPANY_STOPWORDS = {
+    "inc", "ltd", "corp", "canada", "group", "technologies",
+    "corporation", "incorporated", "limited", "llc", "co", "company", "plc", "www",
+}
+_LOCALE_RE = re.compile(r"^/[a-z]{2}(?:-[a-z]{2})?(?=/|$)", re.IGNORECASE)
 _ROLE_STOPWORDS = {
     "intern", "internship", "co", "op", "coop", "2026", "2027",
     "winter", "summer", "fall", "new", "grad",
@@ -22,9 +27,9 @@ _JACCARD_THRESHOLD = 0.6
 _COUNTED_JOBAGENT = {"submitted", "already_applied"}
 
 _REQ_RE = re.compile(
-    r"\bJR\d+"
-    r"|\bR\d{5,}"
-    r"|\bREQ[-_ ]?\d+"
+    r"(?<![A-Za-z0-9])JR\d+"
+    r"|(?<![A-Za-z0-9])R\d{5,}"
+    r"|(?<![A-Za-z0-9])REQ[-_ ]?\d+"
     r"|\((\d{5,7})\)"
     r"|_(\d{5,7})(?=$|[/?#])",
     re.IGNORECASE,
@@ -38,7 +43,9 @@ class DupVerdict:
 
 
 def norm_company(s: str | None) -> str:
-    s = re.sub(r"\([^)]*\)", " ", (s or "").casefold())
+    s = unicodedata.normalize("NFKD", (s or "").casefold())
+    s = "".join(c for c in s if not unicodedata.combining(c))
+    s = re.sub(r"\([^)]*\)", " ", s)
     words = re.sub(r"[^\w\s]", " ", s).split()
     return " ".join(w for w in words if w not in _COMPANY_STOPWORDS)
 
@@ -58,7 +65,8 @@ def norm_url(url: str | None) -> str:
     query = urlencode(
         [(k, v) for k, v in parse_qsl(parts.query) if k.casefold() in _KEEP_QUERY]
     )
-    out = parts.netloc.lower() + parts.path.rstrip("/")
+    host = parts.netloc.lower().removeprefix("www.")
+    out = host + _LOCALE_RE.sub("", parts.path).rstrip("/")
     return out + ("?" + query if query else "")
 
 
@@ -72,16 +80,23 @@ def jaccard(a: set[str], b: set[str]) -> float:
     return len(a & b) / len(union) if union else 0.0
 
 
-def _norm_role(role: str | None) -> str:
-    return " ".join(re.findall(r"\w+", (role or "").casefold()))
+def _raw_role(role: str | None) -> str:
+    return " ".join((role or "").casefold().split())
 
 
 def _req_key(*texts: str | None) -> str | None:
+    """Comparable req id: its digit core when it has digits (R1 == 1), else casefolded."""
     for t in texts:
         r = req_id(t)
         if r:
-            return r.casefold()
+            return re.sub(r"\D", "", r) or r.casefold()
     return None
+
+
+def _bare_key(value: str | None) -> str | None:
+    """Key for a stored req id column that may be a bare token such as '155233'."""
+    value = (value or "").strip()
+    return (re.sub(r"\D", "", value) or value.casefold()) or None
 
 
 def _compare(posting: dict, cand: dict) -> str:
@@ -97,10 +112,10 @@ def _compare(posting: dict, cand: dict) -> str:
     if p_req and c_req:
         return "duplicate" if p_req == c_req else "none"
     p_role = posting.get("role")
+    if _raw_role(p_role) and _raw_role(p_role) == _raw_role(cand["role"]):
+        return "duplicate"
     if jaccard(role_tokens(p_role), role_tokens(cand["role"])) >= _JACCARD_THRESHOLD:
         return "possible"
-    if _norm_role(p_role) and _norm_role(p_role) == _norm_role(cand["role"]):
-        return "duplicate"
     return "none"
 
 
@@ -108,7 +123,7 @@ def _candidates(tracker_rows, submitted_postings, jobagent_entries):
     for r in tracker_rows:
         yield {
             "url": r.get("url"), "company": r.get("company"), "role": r.get("role"),
-            "req": _req_key(r.get("req_id")),
+            "req": _req_key(r.get("req_id")) or _bare_key(r.get("req_id")),
             "label": f"tracker #{r.get('id')}",
         }
     for p in submitted_postings:
