@@ -226,4 +226,32 @@ def build_jobs_tools(
             content = content[:_FOLLOW_UPS_CHARS] + "\n[truncated]"
         return _ok(_FOLLOW_UPS_NOTE + untrusted_block(content))
 
-    return [jobs_scout_now, jobs_list, job_apply, job_skip, jobs_followups]
+    @tool(
+        "job_answer",
+        "Pass the user's reply to a question jobagent asked while applying (an internal task gave the "
+        "question id). Only when the user answered in their own message. For a request to act in the "
+        "Chrome window (captcha) pass exactly 'done' or exactly 'skip'.",
+        {
+            "type": "object",
+            "properties": {
+                "question_id": {"type": "string", "description": "The question id from the internal task."},
+                "answer": {"type": "string", "description": "The user's answer."},
+            },
+            "required": ["question_id", "answer"],
+        },
+    )
+    @_safe
+    async def job_answer(args: dict[str, Any]) -> dict[str, Any]:
+        _require_user_turn("job_answer")
+        qid = str(args.get("question_id") or "").strip()
+        answer = args.get("answer")
+        if not qid or not isinstance(answer, str) or not answer.strip():
+            raise _ToolError("Error: 'question_id' and 'answer' are required")
+        result = await asyncio.to_thread(scheduler.relay.answer, qid, answer.strip())
+        if result == "sent":
+            return _ok("Passed to jobagent.")
+        if result == "expired":
+            return _ok("That question expired; the application was marked needs_user.")
+        return _ok("No such pending question.")
+
+    return [jobs_scout_now, jobs_list, job_apply, job_skip, jobs_followups, job_answer]

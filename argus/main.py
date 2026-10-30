@@ -134,6 +134,7 @@ def build_app(cfg: Config, mail_reader_factory: Callable[[], MailReader] | None 
     )
     if scheduler is not None:
         scheduler.submit = app.submit_internal  # the App exists only now
+        scheduler.relay.submit = app.submit_internal
     app.job_scheduler = scheduler
     app.briefing = BriefingScheduler(
         cfg,

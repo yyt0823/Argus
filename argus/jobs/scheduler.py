@@ -52,6 +52,7 @@ from argus.config import Config
 from argus.jobs.agent import untrusted_block
 from argus.jobs.applier import PRIOR_ATTEMPT, ApplyResult, apply_to
 from argus.jobs.guard import auto_apply_eligible
+from argus.jobs.human_relay import HumanRelay
 from argus.jobs.scout import ScoutResult, run_scout
 from argus.mail.watcher import INTERNAL_PREFIX
 from argus.store import JOB_STATUSES
@@ -185,6 +186,7 @@ class JobScheduler:
         self._cfg = cfg
         self._store = store
         self.submit = submit  # public: main wires it to App.submit_internal after the App exists
+        self.relay = HumanRelay(submit=None)  # public: main wires its submit; used by job_answer
         self._scout_fn = scout_fn
         self._apply_fn = apply_fn
         self._now = now

@@ -2,6 +2,7 @@ from datetime import datetime, timedelta
 
 import pytest
 
+from argus.jobs.human_relay import HumanRelay
 from argus.config import Config, JobsConfig
 from argus.store import Store
 from argus.tools.jobs import build_jobs_tools
@@ -16,6 +17,7 @@ class FakeScheduler:
         self.applying = False
         self.scout_requests = 0
         self.apply_requests: list[int] = []
+        self.relay = HumanRelay(submit=None)
 
     def request_scout(self):
         self.scout_requests += 1
@@ -54,7 +56,7 @@ def add(store, url, fit=4, status=None, seen=NOW, **kw):
 
 
 def test_tool_names(env):
-    assert set(env[3]) == {"jobs_scout_now", "jobs_list", "job_apply", "job_skip", "jobs_followups"}
+    assert set(env[3]) == {"jobs_scout_now", "jobs_list", "job_apply", "job_skip", "jobs_followups", "job_answer"}
 
 
 async def test_scout_now_started_then_already_running(env):
@@ -231,3 +233,28 @@ async def test_apply_after_error_allowed_and_flags_prior_attempt(tmp_path):
     p = store.get_posting(pid)
     assert p["status"] == "queued" and PRIOR_ATTEMPT in p["status_detail"]
     store.close()
+
+
+async def test_job_answer_refused_in_system_turn(env):
+    _, _, sched, t = env
+    calls = []
+    sched.relay.answer = lambda qid, text: calls.append((qid, text)) or "sent"
+    args = {"question_id": "1-1", "answer": "yes"}
+    with turn_context.turn(system=True, at=NOW):
+        r = await t["job_answer"].handler(args)
+    assert r.get("is_error") and "direct request" in text(r) and calls == []
+    with turn_context.turn(system=False, at=NOW):
+        r = await t["job_answer"].handler(args)
+    assert not r.get("is_error") and text(r) == "Passed to jobagent." and calls == [("1-1", "yes")]
+
+
+@pytest.mark.parametrize("result,expected", [
+    ("expired", "That question expired; the application was marked needs_user."),
+    ("unknown", "No such pending question."),
+])
+async def test_job_answer_replies(env, result, expected):
+    _, _, sched, t = env
+    sched.relay.answer = lambda qid, text: result
+    with turn_context.turn(system=False, at=NOW):
+        r = await t["job_answer"].handler({"question_id": "1-1", "answer": "yes"})
+    assert text(r) == expected
