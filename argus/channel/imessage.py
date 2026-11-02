@@ -41,6 +41,7 @@ CAPTURE_TRIES = 12
 CAPTURE_INTERVAL = 0.25
 REMEMBER_NS = 60 * 1_000_000_000  # how long accepted rows stay eligible for pairing
 SENT_TEXT_WINDOW = 60.0  # seconds a sent text is remembered for the self-reply loop guard
+RESYNC_TOLERANCE_NS = 100_000_000  # re-synced copies keep the original date to within ~1 ms
 RATE_WINDOW = 60.0  # seconds
 RATE_LIMIT = 20  # max sends per RATE_WINDOW
 
@@ -172,6 +173,28 @@ class IMessageChannel(Channel):
         with closing(self._connect()) as c:
             return c.execute(sql, (*self.chat_guids, rowid)).fetchone()[0]
 
+    def _is_resync_copy(self, rowid: int, body: str, date: int | None) -> bool:
+        """True if an earlier row in the same chats has this exact date and text.
+
+        iCloud Messages sometimes re-downloads old messages as new rows (new ROWID and guid,
+        and a ``date`` within a millisecond of the original). Nobody sends the same text twice
+        within 100 ms, so a match with an earlier row means we already handled it.
+        """
+        if not date:
+            return False
+        placeholders = ",".join("?" for _ in self.chat_guids)
+        sql = (
+            "SELECT m.text, m.attributedBody FROM message m "
+            "JOIN chat_message_join j ON j.message_id = m.ROWID JOIN chat c ON c.ROWID = j.chat_id "
+            f"WHERE c.guid IN ({placeholders}) AND m.ROWID < ? AND m.date BETWEEN ? AND ? "
+            "AND m.item_type = 0 AND m.associated_message_type = 0"
+        )
+        with closing(self._connect()) as c:
+            rows = c.execute(
+                sql, (*self.chat_guids, rowid, date - RESYNC_TOLERANCE_NS, date + RESYNC_TOLERANCE_NS)
+            ).fetchall()
+        return any(self._body(text, blob) == body for text, blob in rows)
+
     def _rebuild_recent(self, checkpoint: int) -> None:
         """After a restart, restore pairing memory from rows already consumed before the checkpoint.
 
@@ -257,6 +280,9 @@ class IMessageChannel(Channel):
             date = date or 0
             if self._pair_or_remember(body, bool(is_from_me), date):
                 continue
+            if self._is_resync_copy(rowid, body, date):
+                log.info("dropping row %s: re-synced copy of an earlier message", guid)
+                continue
             accepted.append(IncomingMessage(id=guid, text=body, received_at=apple_ns_to_local(date)))
         if max_rowid != checkpoint:
             # Queue + checkpoint in one transaction so a crash cannot lose accepted messages.
@@ -290,6 +316,9 @@ class IMessageChannel(Channel):
                 continue  # Argus's own reply
             body = self._body(text, blob)
             if not body or body.startswith("🤖"):
+                continue
+            if self._is_resync_copy(rowid, body, date):
+                log.info("dropping row %s: re-synced copy of an earlier message", guid)
                 continue
             accepted.append(IncomingMessage(id=guid, text=body, received_at=apple_ns_to_local(date or 0)))
             reply_chat = chat_guid
