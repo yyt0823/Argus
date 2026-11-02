@@ -294,3 +294,40 @@ def test_contact_send_retries_and_rate_limit(fake_chat_db, store):
         c.send("x")
     with pytest.raises(SendError, match="rate limit"):
         c.send("x")
+
+
+# --- iCloud re-sync: old rows reappear with new ROWIDs and guids but their original date ---
+
+def test_resynced_copies_of_consumed_messages_dropped(fake_chat_db, store):
+    c = chan(fake_chat_db, store); c.poll()
+    fake_chat_db.add("Hi", 1, T0, as_blob=True)
+    fake_chat_db.add("Hi", 0, T0)
+    assert [m.text for m in c.poll()] == ["Hi"]
+    later = T0 + timedelta(days=2)
+    fake_chat_db.add("Hi", 0, T0 + timedelta(microseconds=700))  # re-synced copies, twice
+    fake_chat_db.add("Hi", 0, T0 + timedelta(microseconds=700))
+    fake_chat_db.add("new", 1, later, as_blob=True)
+    assert [m.text for m in c.poll()] == ["new"]
+
+def test_resynced_copies_dropped_after_restart(fake_chat_db, store):
+    c = chan(fake_chat_db, store); c.poll()
+    fake_chat_db.add("check email", 1, T0, as_blob=True)
+    fake_chat_db.add("check email", 0, T0)
+    c.poll()
+    c2 = chan(fake_chat_db, store)
+    fake_chat_db.add("check email", 0, T0)
+    assert c2.poll() == []
+
+def test_same_text_at_a_new_time_still_delivered(fake_chat_db, store):
+    c = chan(fake_chat_db, store); c.poll()
+    fake_chat_db.add("Hi", 1, T0, as_blob=True)
+    c.poll()
+    fake_chat_db.add("Hi", 1, T0 + timedelta(hours=1), as_blob=True)
+    assert [m.text for m in c.poll()] == ["Hi"]
+
+def test_contact_resynced_copies_dropped(fake_chat_db, store):
+    c = cchan(fake_chat_db, store); c.poll()
+    fake_chat_db.add("Hi", 0, T0)
+    assert [m.text for m in c.poll()] == ["Hi"]
+    fake_chat_db.add("Hi", 0, T0)
+    assert c.poll() == []
